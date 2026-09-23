@@ -32,11 +32,20 @@ typedef struct {
 	uint32_t rx_overrun_count;   /**< CAN_ERR_CRTL_RX_OVERFLOW error frames, see csp_can_socketcan_rx_overrun_count() */
 } can_context_t;
 
+static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t * packet);
+
 /* Resolve the driver context behind an interface without dereferencing a
- * foreign driver_data: a socketcan interface is embedded in its context, so
- * the context's iface member must be the interface itself. */
+ * foreign driver_data. Three checks, because other drivers (KISS) embed the
+ * interface in a context with the same {name, iface} prefix: the interface
+ * must be a CAN interface (nexthop), its CAN interface data must name this
+ * driver's transmit function, and the context's iface member must be the
+ * interface itself. */
 static const can_context_t * socketcan_ctx(const csp_iface_t * iface) {
-	if ((iface == NULL) || (iface->driver_data == NULL)) {
+	if (!csp_can_is_can_interface(iface) || (iface->driver_data == NULL)) {
+		return NULL;
+	}
+	const csp_can_interface_data_t * ifdata = iface->interface_data;
+	if (ifdata->tx_func != csp_can_tx_frame) {
 		return NULL;
 	}
 	const can_context_t * ctx = iface->driver_data;
@@ -227,7 +236,7 @@ int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t net
 
 	filters[0].can_id = addr << CFP2_DST_OFFSET;
 	filters[0].can_mask = CFP2_DST_MASK << CFP2_DST_OFFSET;
-	filters[1].can_id = ((1 << (csp_id_get_host_bits() - netmask)) - 1) << CFP2_DST_OFFSET;
+	filters[1].can_id = ((1 << (CFP2_DST_SIZE - netmask)) - 1) << CFP2_DST_OFFSET;
 	filters[1].can_mask = CFP2_DST_MASK << CFP2_DST_OFFSET;
 	filters[2].can_id = 0x3FFF << CFP2_DST_OFFSET;
 	filters[2].can_mask = CFP2_DST_MASK << CFP2_DST_OFFSET;

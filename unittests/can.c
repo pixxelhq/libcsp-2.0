@@ -503,6 +503,33 @@ START_TEST(test_socketcan_counters_zero_for_foreign_iface)
 }
 END_TEST
 
+/* The KISS driver's context has the same {name, iface} prefix as the
+ * socketcan one, with a smaller tail. A getter that identifies "its" context
+ * by that prefix alone would read past the end of a KISS allocation. */
+static int fake_kiss_nexthop(csp_iface_t * iface, uint16_t via, csp_packet_t * packet, int from_me) {
+	(void)iface; (void)via; (void)from_me;
+	csp_buffer_free(packet);
+	return CSP_ERR_NONE;
+}
+
+START_TEST(test_socketcan_counters_zero_for_kiss_like_context)
+{
+	struct {
+		char name[CSP_IFLIST_NAME_MAX + 1];
+		csp_iface_t iface;
+		uint8_t tail[64];
+	} fake;
+	memset(&fake, 0xAB, sizeof(fake));   /* whatever lies past iface is non-zero */
+	memset(&fake.iface, 0, sizeof(fake.iface));
+	fake.iface.name = fake.name;
+	fake.iface.driver_data = &fake;
+	fake.iface.nexthop = fake_kiss_nexthop;
+
+	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(&fake.iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(&fake.iface), 0);
+}
+END_TEST
+
 #endif /* CSP_HAVE_LIBSOCKETCAN */
 
 Suite * can_suite(void) {
@@ -534,6 +561,7 @@ Suite * can_suite(void) {
 	tcase_add_test(tc, test_socketcan_filters_promisc_accepts_all);
 	tcase_add_test(tc, test_socketcan_filters_v2_unchanged);
 	tcase_add_test(tc, test_socketcan_counters_zero_for_foreign_iface);
+	tcase_add_test(tc, test_socketcan_counters_zero_for_kiss_like_context);
 #endif
 
 	suite_add_tcase(s, tc);

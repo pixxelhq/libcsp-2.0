@@ -712,14 +712,19 @@ static int csp_can2_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 	return CSP_ERR_NONE;
 }
 
+int csp_can_is_can_interface(const csp_iface_t * iface) {
+
+	if ((iface == NULL) || (iface->interface_data == NULL)) {
+		return 0;
+	}
+	return (iface->nexthop == csp_can1_tx) || (iface->nexthop == csp_can2_tx);
+}
+
 uint32_t csp_can_rx_timeout_count(const csp_iface_t * iface) {
 
 	/* interface_data is a different type per interface kind, so only read it
 	 * once the nexthop proves this is a CAN interface. */
-	if ((iface == NULL) || (iface->interface_data == NULL)) {
-		return 0;
-	}
-	if ((iface->nexthop != csp_can1_tx) && (iface->nexthop != csp_can2_tx)) {
+	if (!csp_can_is_can_interface(iface)) {
 		return 0;
 	}
 	return ((const csp_can_interface_data_t *)iface->interface_data)->rx_timeouts;

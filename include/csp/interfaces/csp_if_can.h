@@ -263,6 +263,17 @@ int csp_can_tx(csp_iface_t * iface, uint16_t via, csp_packet_t *packet);
 int csp_can_rx(csp_iface_t * iface, uint32_t id, const uint8_t * data, uint8_t dlc, uint32_t timestamp_rx, int *pxTaskWoken);
 
 /**
+ * Whether an interface was added through csp_can_add_interface().
+ *
+ * Interface data and driver data are different types per interface kind, so
+ * anything that wants to read them as CAN structures must check this first.
+ *
+ * @param[in] iface any interface, or NULL.
+ * @return 1 for a CAN interface, 0 otherwise.
+ */
+int csp_can_is_can_interface(const csp_iface_t * iface);
+
+/**
  * Number of partial packets this interface discarded because no fragment
  * arrived within #CSP_CAN_PBUF_TIMEOUT_MS.
  *
