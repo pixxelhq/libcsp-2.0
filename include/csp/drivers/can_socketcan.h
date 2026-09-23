@@ -8,6 +8,7 @@
 #pragma once
 
 #include <csp/interfaces/csp_if_can.h>
+#include <linux/can.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,6 +57,41 @@ csp_iface_t * csp_can_socketcan_init(const char * device, unsigned int node_id, 
  * @return #CSP_ERR_NONE on success, otherwise an error code.
  */
 int csp_can_socketcan_stop(csp_iface_t * iface);
+
+/**
+ * Build the CAN_RAW_FILTER set for a socketcan interface.
+ *
+ * The kernel treats the array as a disjunction, so "addressed to me OR
+ * broadcast" is expressed as separate entries. For CSP 1.x this yields the
+ * interface address and the 5-bit broadcast address (one entry when they
+ * coincide); for CSP 2.x the interface address, the subnet broadcast and the
+ * global broadcast. In promiscuous mode a single accept-all entry is built.
+ *
+ * @param[in] version CSP protocol version (1 or 2)
+ * @param[in] addr interface address
+ * @param[in] netmask interface netmask in bits (CSP 2.x subnet broadcast)
+ * @param[in] promisc true to accept every frame
+ * @param[out] filters array to fill
+ * @param[in] max_filters capacity of @p filters, at least 3
+ * @return number of filters written, or #CSP_ERR_INVAL if @p filters is too small.
+ */
+int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t netmask, bool promisc, struct can_filter * filters, unsigned int max_filters);
+
+/**
+ * Times a transmit had to back off because the socket buffer was full (ENOBUFS).
+ * Measures qdisc/txqueuelen pressure; the retry loop itself only reports total failure.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_tx_enobufs_count(const csp_iface_t * iface);
+
+/**
+ * Controller RX FIFO overruns (CAN_ERR_CRTL_RX_OVERFLOW) seen on this interface.
+ * The controller drops isolated frames in hardware and reports them only as an
+ * error frame, so this is the one loss path invisible to every other counter.
+ * Each overrun is also counted under csp_iface_t::rx_error.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_rx_overrun_count(const csp_iface_t * iface);
 
 #ifdef __cplusplus
 }
