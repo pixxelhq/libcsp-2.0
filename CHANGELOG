@@ -6,6 +6,10 @@ libcsp 2.2, xx-xx-202x
 - new: A new build time constat CSP_BUFFER_RESERVED_COUNT is added (#925)
 - new: CSP_CFP_OUT_OF_ORDER_RX reassembles CAN fragments delivered out of order (#1023)
 - new: CSP_CAN_PBUF_TIMEOUT_MS makes the CAN reassembly timeout configurable (#1023)
+- new: csp_send_direct_iface() and csp_qfifo_wake_up() are public API
+- new: csp_can_rx_timeout_count() counts partial packets discarded by the reassembly timeout
+- new: csp_can_socketcan_tx_enobufs_count() and csp_can_socketcan_rx_overrun_count() driver counters
+- fix: socketcan non-promiscuous filter accepts CSP 1.x broadcast frames
 - improvement: Small Fragmentation Protocol has been reworked to remove malloc() (#742)
 - improvement: PyCSP can now be built without SocketCAN (#638)
 - improvement: PyCSP can now take mask and is_default optional parameter (#924)

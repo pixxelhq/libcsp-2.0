@@ -4,6 +4,11 @@
 
 #include <csp/csp.h>
 #include <csp/interfaces/csp_if_can.h>
+#include <csp/csp_interface.h>
+#if (CSP_HAVE_LIBSOCKETCAN)
+#include <linux/can.h>
+#include <csp/drivers/can_socketcan.h>
+#endif
 
 #include "../src/csp_qfifo.h"
 
@@ -381,6 +386,125 @@ START_TEST(test_can_v2_duplicate_ahead)
 }
 END_TEST
 
+/* Per-interface reassembly timeout counter: a partial packet that is
+ * reclaimed by the pbuf timeout is counted on its interface, so a host can
+ * tell timeout fallout apart from independent frame losses. */
+START_TEST(test_can_v1_missing_fragment_counts_timeout)
+{
+	static const unsigned int order[] = {0, 1, 2, 3, 4, 5};
+
+	can_test_init(1);
+	uint32_t before = csp_can_rx_timeout_count(&rx_iface);
+
+	send_packet(48);
+	feed(order, 6);
+	expect_nothing();
+
+	usleep((CSP_CAN_PBUF_TIMEOUT_MS + 50) * 1000);
+
+	send_packet(8);
+	feed_all();
+	expect_delivered(8);
+
+	ck_assert_uint_eq(csp_can_rx_timeout_count(&rx_iface), before + 1);
+	ck_assert_uint_eq(csp_can_rx_timeout_count(NULL), 0);
+}
+END_TEST
+
+/* csp_send_direct_iface() is public: a host that owns several interfaces
+ * with the same address needs to pick the outgoing one per packet. */
+START_TEST(test_send_direct_iface_forces_interface)
+{
+	can_test_init(1);
+
+	csp_packet_t * packet = csp_buffer_get(0);
+	ck_assert_ptr_nonnull(packet);
+	packet->length = 4;
+	for (uint16_t i = 0; i < packet->length; i++) {
+		packet->data[i] = pattern(i);
+	}
+
+	csp_id_t idout = {.pri = CSP_PRIO_NORM, .flags = 0, .src = TX_ADDR, .dst = RX_ADDR, .dport = DPORT, .sport = SPORT};
+	frame_count = 0;
+	csp_send_direct_iface(&idout, packet, &tx_iface, CSP_NO_VIA_ADDRESS, 1);
+	ck_assert_uint_gt(frame_count, 0);
+
+	feed_all();
+	expect_delivered(4);
+}
+END_TEST
+
+#if (CSP_HAVE_LIBSOCKETCAN)
+
+static int count_matches(uint32_t id, const struct can_filter * f, int n) {
+	int matches = 0;
+	for (int i = 0; i < n; i++) {
+		if ((id & f[i].can_mask) == (f[i].can_id & f[i].can_mask)) {
+			matches++;
+		}
+	}
+	return matches;
+}
+
+/* CSP 1.x non-promiscuous filter: accept frames addressed to this interface
+ * OR to the broadcast address, each exactly once. */
+START_TEST(test_socketcan_filters_v1_own_or_broadcast)
+{
+	struct can_filter f[3];
+	int n = csp_can_socketcan_build_filters(1, 4, 0, false, f, 3);
+	ck_assert_int_eq(n, 2);
+
+	for (uint32_t dst = 0; dst < (1U << CFP_HOST_SIZE); dst++) {
+		uint32_t id = CFP_MAKE_DST(dst) | CFP_MAKE_SRC(7) | CFP_MAKE_TYPE(0);
+		ck_assert_int_eq(count_matches(id, f, n), (dst == 4 || dst == 31) ? 1 : 0);
+	}
+}
+END_TEST
+
+START_TEST(test_socketcan_filters_v1_broadcast_address_collapses)
+{
+	struct can_filter f[3];
+	int n = csp_can_socketcan_build_filters(1, 31, 0, false, f, 3);
+	ck_assert_int_eq(n, 1);
+	ck_assert_int_eq(count_matches(CFP_MAKE_DST(31), f, n), 1);
+	ck_assert_int_eq(count_matches(CFP_MAKE_DST(4), f, n), 0);
+}
+END_TEST
+
+START_TEST(test_socketcan_filters_promisc_accepts_all)
+{
+	struct can_filter f[3];
+	int n = csp_can_socketcan_build_filters(1, 4, 0, true, f, 3);
+	ck_assert_int_eq(n, 1);
+	ck_assert_uint_eq(f[0].can_mask, 0);
+}
+END_TEST
+
+START_TEST(test_socketcan_filters_v2_unchanged)
+{
+	struct can_filter f[3];
+	int n = csp_can_socketcan_build_filters(2, 4, 0, false, f, 3);
+	ck_assert_int_eq(n, 3);
+	ck_assert_uint_eq(f[0].can_id, 4U << CFP2_DST_OFFSET);
+	ck_assert_uint_eq(f[2].can_id, 0x3FFFU << CFP2_DST_OFFSET);
+	ck_assert_int_eq(csp_can_socketcan_build_filters(1, 4, 0, false, f, 1), CSP_ERR_INVAL);
+}
+END_TEST
+
+/* Driver counters are only meaningful on a socketcan interface; anything
+ * else reads as zero rather than as garbage from a foreign driver_data. */
+START_TEST(test_socketcan_counters_zero_for_foreign_iface)
+{
+	can_test_init(1);
+	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(NULL), 0);
+}
+END_TEST
+
+#endif /* CSP_HAVE_LIBSOCKETCAN */
+
 Suite * can_suite(void) {
 
 	Suite * s = suite_create("CAN");
@@ -401,6 +525,16 @@ Suite * can_suite(void) {
 	tcase_add_test(tc, test_can_v2_reordered_within_window);
 	tcase_add_test(tc, test_can_v2_beyond_window_is_lost);
 	tcase_add_test(tc, test_can_v2_duplicate_ahead);
+
+	tcase_add_test(tc, test_can_v1_missing_fragment_counts_timeout);
+	tcase_add_test(tc, test_send_direct_iface_forces_interface);
+#if (CSP_HAVE_LIBSOCKETCAN)
+	tcase_add_test(tc, test_socketcan_filters_v1_own_or_broadcast);
+	tcase_add_test(tc, test_socketcan_filters_v1_broadcast_address_collapses);
+	tcase_add_test(tc, test_socketcan_filters_promisc_accepts_all);
+	tcase_add_test(tc, test_socketcan_filters_v2_unchanged);
+	tcase_add_test(tc, test_socketcan_counters_zero_for_foreign_iface);
+#endif
 
 	suite_add_tcase(s, tc);
 	return s;

@@ -82,12 +82,23 @@ START_TEST(test_bind_no_listen_conn_764)
 }
 END_TEST
 
+/* A host that runs csp_route_work() on its own thread needs a public way
+ * to interrupt the blocking FIFO read when it shuts that thread down. */
+START_TEST(test_route_work_wake_up_returns_timedout)
+{
+	csp_init();
+	csp_qfifo_wake_up();
+	ck_assert_int_eq(csp_route_work(), CSP_ERR_TIMEDOUT);
+}
+END_TEST
+
 Suite * route_suite(void) {
 	Suite *s = suite_create("route");
 
 	TCase *tc = tcase_create("route");
 	tcase_add_test(tc, test_bind_no_listen_conn_less_764);
 	tcase_add_test(tc, test_bind_no_listen_conn_764);
+	tcase_add_test(tc, test_route_work_wake_up_returns_timedout);
 
 	suite_add_tcase(s, tc);
 
