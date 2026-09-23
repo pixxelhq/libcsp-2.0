@@ -211,6 +211,7 @@ typedef struct {
 #endif
 	csp_can_driver_tx_t tx_func; /**< Tx function */
 	csp_packet_t * pbufs; /**< PBUF queue */
+	uint32_t rx_timeouts; /**< Partial packets discarded by the reassembly timeout, see csp_can_rx_timeout_count() */
 } csp_can_interface_data_t;
 
 /**
@@ -260,6 +261,20 @@ int csp_can_tx(csp_iface_t * iface, uint16_t via, csp_packet_t *packet);
  * @return #CSP_ERR_NONE on success, otherwise an error code.
  */
 int csp_can_rx(csp_iface_t * iface, uint32_t id, const uint8_t * data, uint8_t dlc, uint32_t timestamp_rx, int *pxTaskWoken);
+
+/**
+ * Number of partial packets this interface discarded because no fragment
+ * arrived within #CSP_CAN_PBUF_TIMEOUT_MS.
+ *
+ * A timeout reclaims the reassembly buffer mid-stream; every later fragment
+ * of that packet is then counted under csp_iface_t::frame. Reporting the
+ * timeouts separately lets a host tell that fallout apart from independent
+ * frame losses.
+ *
+ * @param[in] iface CAN interface, or any other interface (returns 0).
+ * @return timeout count, 0 for NULL or a non-CAN interface.
+ */
+uint32_t csp_can_rx_timeout_count(const csp_iface_t * iface);
 
 #ifdef __cplusplus
 }

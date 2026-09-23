@@ -93,6 +93,8 @@ void csp_can_pbuf_cleanup(csp_can_interface_data_t * ifdata, int * task_woken) {
 		/* Perform cleanup in used pbufs */
 		if (now - packet->last_used > PBUF_TIMEOUT_MS) {
 
+			ifdata->rx_timeouts++;
+
 			/* Erase from list prev->next = next */
 			if (prev) {
 				prev->next = next;
