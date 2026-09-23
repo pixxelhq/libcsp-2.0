@@ -84,6 +84,22 @@ typedef struct csp_alias_s {
  */
 void csp_qfifo_write(csp_packet_t * packet, csp_iface_t * iface, void * pxTaskWoken);
 
+/**
+ * Send a packet on a specific interface, bypassing address based routing.
+ *
+ * The packet is always consumed by this call, either handed over to the
+ * interface or freed on error. Unlike csp_send(), the source address in
+ * @p idout is used as given: set it to the interface address yourself when
+ * the packet originates here.
+ *
+ * @param[in] idout header (identifier) to send with
+ * @param[in] packet packet to send
+ * @param[in] iface interface to send the packet on
+ * @param[in] via via address, or #CSP_NO_VIA_ADDRESS to send directly to the destination
+ * @param[in] from_me 1 if the packet originates from the local node, 0 if it is a routed message
+ */
+void csp_send_direct_iface(const csp_id_t * idout, csp_packet_t * packet, csp_iface_t * iface, uint16_t via, int from_me);
+
 #ifdef __cplusplus
 }
 #endif

@@ -323,6 +323,18 @@ int csp_bind_callback(csp_callback_t callback, uint8_t port);
 int csp_route_work(void);
 
 /**
+ * Wake up a thread blocked in csp_route_work().
+ *
+ * Enqueues a wake-up sentinel on the router input queue, which makes the
+ * pending (or next) csp_route_work() call return #CSP_ERR_TIMEDOUT without
+ * routing anything. Intended for hosts that run the router on a dedicated
+ * thread and need to stop it: set your stop flag, call this, then join.
+ * The sentinel is dropped if the queue is full; in that case the router is
+ * not blocked and will observe the stop flag after its next packet.
+ */
+void csp_qfifo_wake_up(void);
+
+/**
  * Set the bridge interfaces.
  *
  * @param[in] if_a CSP Interface `A`
