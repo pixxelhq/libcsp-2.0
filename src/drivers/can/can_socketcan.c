@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <csp/csp_debug.h>
 #include <sys/socket.h>
+#include <sys/select.h> /* fd_set/select(); not pulled in transitively on musl */
 #include <unistd.h>
 #include <errno.h>
 #include <sys/ioctl.h>
