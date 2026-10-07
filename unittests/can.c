@@ -1,6 +1,7 @@
 #include <check.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <csp/csp.h>
 #include <csp/interfaces/csp_if_can.h>
@@ -498,8 +499,14 @@ START_TEST(test_socketcan_counters_zero_for_foreign_iface)
 	can_test_init(1);
 	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(&rx_iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_eagain_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_bus_off_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_passive_count(&rx_iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(NULL), 0);
 	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_eagain_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_bus_off_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_passive_count(NULL), 0);
 }
 END_TEST
 
@@ -527,6 +534,67 @@ START_TEST(test_socketcan_counters_zero_for_kiss_like_context)
 
 	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(&fake.iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(&fake.iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_eagain_count(&fake.iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_bus_off_count(&fake.iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_passive_count(&fake.iface), 0);
+}
+END_TEST
+
+/* The TX retry policy. The socket is non-blocking, so a full per-socket send
+ * buffer surfaces as EAGAIN just as a full qdisc surfaces as ENOBUFS, and both
+ * must back off for real: charging the budget without sleeping gave up after
+ * ~200 instantaneous retries while reporting a one-second wait. */
+START_TEST(test_socketcan_backoff_eagain_sleeps_until_budget)
+{
+	uint32_t waiting_ms = 0;
+	const unsigned int sleeps = CSP_CAN_SOCKETCAN_TX_BUDGET_MS / CSP_CAN_SOCKETCAN_TX_BACKOFF_MS;
+
+	for (unsigned int i = 0; i < sleeps; i++) {
+		ck_assert_int_eq(csp_can_socketcan_tx_backoff(EAGAIN, &waiting_ms), CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP);
+	}
+	ck_assert_uint_eq(waiting_ms, CSP_CAN_SOCKETCAN_TX_BUDGET_MS);
+
+	/* Only once the whole budget has actually been slept does it give up */
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(EAGAIN, &waiting_ms), CSP_CAN_SOCKETCAN_TX_GIVE_UP);
+	ck_assert_uint_eq(waiting_ms, CSP_CAN_SOCKETCAN_TX_BUDGET_MS);
+}
+END_TEST
+
+START_TEST(test_socketcan_backoff_enobufs_same_policy)
+{
+	uint32_t waiting_ms = 0;
+	const unsigned int sleeps = CSP_CAN_SOCKETCAN_TX_BUDGET_MS / CSP_CAN_SOCKETCAN_TX_BACKOFF_MS;
+
+	for (unsigned int i = 0; i < sleeps; i++) {
+		ck_assert_int_eq(csp_can_socketcan_tx_backoff(ENOBUFS, &waiting_ms), CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP);
+	}
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(ENOBUFS, &waiting_ms), CSP_CAN_SOCKETCAN_TX_GIVE_UP);
+
+	/* The two full-buffer conditions share one budget */
+	waiting_ms = CSP_CAN_SOCKETCAN_TX_BUDGET_MS - CSP_CAN_SOCKETCAN_TX_BACKOFF_MS;
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(EAGAIN, &waiting_ms), CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP);
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(ENOBUFS, &waiting_ms), CSP_CAN_SOCKETCAN_TX_GIVE_UP);
+}
+END_TEST
+
+/* A signal is not buffer pressure: retry at once and leave the budget alone */
+START_TEST(test_socketcan_backoff_eintr_is_free)
+{
+	uint32_t waiting_ms = 0;
+	for (unsigned int i = 0; i < 1000; i++) {
+		ck_assert_int_eq(csp_can_socketcan_tx_backoff(EINTR, &waiting_ms), CSP_CAN_SOCKETCAN_TX_RETRY_NOW);
+	}
+	ck_assert_uint_eq(waiting_ms, 0);
+}
+END_TEST
+
+START_TEST(test_socketcan_backoff_hard_error_fails_immediately)
+{
+	uint32_t waiting_ms = 7;
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(EINVAL, &waiting_ms), CSP_CAN_SOCKETCAN_TX_FAIL);
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(ENETDOWN, &waiting_ms), CSP_CAN_SOCKETCAN_TX_FAIL);
+	ck_assert_uint_eq(waiting_ms, 7);
+	ck_assert_int_eq(csp_can_socketcan_tx_backoff(EAGAIN, NULL), CSP_CAN_SOCKETCAN_TX_FAIL);
 }
 END_TEST
 
@@ -562,6 +630,10 @@ Suite * can_suite(void) {
 	tcase_add_test(tc, test_socketcan_filters_v2_unchanged);
 	tcase_add_test(tc, test_socketcan_counters_zero_for_foreign_iface);
 	tcase_add_test(tc, test_socketcan_counters_zero_for_kiss_like_context);
+	tcase_add_test(tc, test_socketcan_backoff_eagain_sleeps_until_budget);
+	tcase_add_test(tc, test_socketcan_backoff_enobufs_same_policy);
+	tcase_add_test(tc, test_socketcan_backoff_eintr_is_free);
+	tcase_add_test(tc, test_socketcan_backoff_hard_error_fails_immediately);
 #endif
 
 	suite_add_tcase(s, tc);

@@ -77,12 +77,71 @@ int csp_can_socketcan_stop(csp_iface_t * iface);
  */
 int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t netmask, bool promisc, struct can_filter * filters, unsigned int max_filters);
 
+/** Sleep between two attempts to write a frame the kernel would not take. */
+#define CSP_CAN_SOCKETCAN_TX_BACKOFF_MS 5
+/** Total back-off a single frame may spend before the packet is abandoned. */
+#define CSP_CAN_SOCKETCAN_TX_BUDGET_MS 1000
+/** SO_SNDBUF requested at open. The kernel clamps it to net.core.wmem_max. */
+#define CSP_CAN_SOCKETCAN_SNDBUF_BYTES (4 * 1024 * 1024)
+
+/** What csp_can_socketcan_tx_backoff() tells the transmit loop to do next. */
+typedef enum {
+	CSP_CAN_SOCKETCAN_TX_RETRY_NOW,   /**< EINTR: write again at once, budget untouched */
+	CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP, /**< buffers full: sleep CSP_CAN_SOCKETCAN_TX_BACKOFF_MS, then write again */
+	CSP_CAN_SOCKETCAN_TX_GIVE_UP,     /**< budget exhausted: abandon the packet */
+	CSP_CAN_SOCKETCAN_TX_FAIL,        /**< hard error (or bad argument): abandon the packet */
+} csp_can_socketcan_tx_action_t;
+
 /**
- * Times a transmit had to back off because the socket buffer was full (ENOBUFS).
- * Measures qdisc/txqueuelen pressure; the retry loop itself only reports total failure.
+ * Decide how the transmit loop reacts to a failed write().
+ *
+ * The socket is non-blocking, so two different "no room" conditions reach
+ * the driver: ENOBUFS when the netdev qdisc (txqueuelen) is full and EAGAIN
+ * when the per-socket send buffer (SO_SNDBUF) is full. Both are the controller
+ * not draining fast enough, and both back off for CSP_CAN_SOCKETCAN_TX_BACKOFF_MS
+ * against one shared CSP_CAN_SOCKETCAN_TX_BUDGET_MS. Returning GIVE_UP only
+ * once @p waiting_ms has reached the budget means a packet is abandoned after
+ * the budget has genuinely been slept, never after a burst of instantaneous
+ * retries. EINTR is retried without charging the budget.
+ *
+ * @param[in] errnum errno from the failed write()
+ * @param[in,out] waiting_ms back-off already spent on this frame; advanced on RETRY_SLEEP
+ * @return the action to take
+ */
+csp_can_socketcan_tx_action_t csp_can_socketcan_tx_backoff(int errnum, uint32_t * waiting_ms);
+
+/**
+ * Times a transmit had to back off because the netdev qdisc was full (ENOBUFS).
+ * Measures txqueuelen pressure. Zero here with csp_can_socketcan_tx_eagain_count()
+ * climbing means the socket send buffer, not the qdisc, is the choke point.
  * @return count, 0 for NULL or a non-socketcan interface.
  */
 uint32_t csp_can_socketcan_tx_enobufs_count(const csp_iface_t * iface);
+
+/**
+ * Times a transmit had to back off because the socket send buffer was full
+ * (EAGAIN): more frames in flight than SO_SNDBUF allows, i.e. the controller
+ * is not completing frames as fast as they are offered. On a shared bus this
+ * is what losing arbitration looks like from the socket.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_tx_eagain_count(const csp_iface_t * iface);
+
+/**
+ * CAN_ERR_BUSOFF error frames: the controller left the bus. With a restart
+ * delay configured it comes back on its own, but every frame queued meanwhile
+ * was lost and every peer's reassembly of them is stranded.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_bus_off_count(const csp_iface_t * iface);
+
+/**
+ * CAN_ERR_CRTL_TX_PASSIVE notifications: the controller's TX error counter
+ * crossed 127, so it is failing to get ACKs on this bus. Transmits still go
+ * out but slowly, which is one way the socket send buffer comes to fill.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_tx_passive_count(const csp_iface_t * iface);
 
 /**
  * Controller RX FIFO overruns (CAN_ERR_CRTL_RX_OVERFLOW) seen on this interface.

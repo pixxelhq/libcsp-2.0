@@ -21,6 +21,11 @@
 
 #include <csp/csp.h>
 #include <csp/csp_id.h>
+#include <csp/arch/csp_time.h>
+
+/* A give-up is logged at most this often per interface. A starved sender
+ * abandons packets in bursts, and one line per packet flooded the FSW logger. */
+#define GIVEUP_LOG_INTERVAL_MS 1000
 
 // CAN interface data, state, etc.
 typedef struct {
@@ -30,7 +35,12 @@ typedef struct {
 	pthread_t rx_thread;
 	int socket;
 	uint32_t tx_enobufs_retries; /**< write() backoffs on ENOBUFS, see csp_can_socketcan_tx_enobufs_count() */
+	uint32_t tx_eagain_retries;  /**< write() backoffs on EAGAIN, see csp_can_socketcan_tx_eagain_count() */
 	uint32_t rx_overrun_count;   /**< CAN_ERR_CRTL_RX_OVERFLOW error frames, see csp_can_socketcan_rx_overrun_count() */
+	uint32_t bus_off_count;      /**< CAN_ERR_BUSOFF error frames, see csp_can_socketcan_bus_off_count() */
+	uint32_t tx_passive_count;   /**< CAN_ERR_CRTL_TX_PASSIVE error frames, see csp_can_socketcan_tx_passive_count() */
+	uint32_t giveup_last_ms;     /**< csp_get_ms() of the last give-up line printed, 0 = never */
+	uint32_t giveup_suppressed;  /**< give-ups not printed since giveup_last_ms */
 } can_context_t;
 
 static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t * packet);
@@ -61,6 +71,55 @@ uint32_t csp_can_socketcan_tx_enobufs_count(const csp_iface_t * iface) {
 uint32_t csp_can_socketcan_rx_overrun_count(const csp_iface_t * iface) {
 	const can_context_t * ctx = socketcan_ctx(iface);
 	return ctx ? ctx->rx_overrun_count : 0;
+}
+
+uint32_t csp_can_socketcan_tx_eagain_count(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->tx_eagain_retries : 0;
+}
+
+uint32_t csp_can_socketcan_bus_off_count(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->bus_off_count : 0;
+}
+
+uint32_t csp_can_socketcan_tx_passive_count(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->tx_passive_count : 0;
+}
+
+csp_can_socketcan_tx_action_t csp_can_socketcan_tx_backoff(int errnum, uint32_t * waiting_ms) {
+	if (waiting_ms == NULL) {
+		return CSP_CAN_SOCKETCAN_TX_FAIL;
+	}
+	switch (errnum) {
+		case EINTR:
+			return CSP_CAN_SOCKETCAN_TX_RETRY_NOW;
+		case ENOBUFS: /* qdisc (txqueuelen) full */
+		case EAGAIN:  /* socket send buffer (SO_SNDBUF) full */
+			if (*waiting_ms >= CSP_CAN_SOCKETCAN_TX_BUDGET_MS) {
+				return CSP_CAN_SOCKETCAN_TX_GIVE_UP;
+			}
+			*waiting_ms += CSP_CAN_SOCKETCAN_TX_BACKOFF_MS;
+			return CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP;
+		default:
+			return CSP_CAN_SOCKETCAN_TX_FAIL;
+	}
+}
+
+/* One line per GIVEUP_LOG_INTERVAL_MS per interface, carrying the real errno
+ * and how long was actually waited. The previous unconditional line claimed
+ * ">1000 ms" even when the loop had given up within a millisecond. */
+static void socketcan_log_giveup(can_context_t * ctx, int errnum, uint32_t waited_ms) {
+	const uint32_t now = csp_get_ms();
+	if ((ctx->giveup_last_ms != 0) && ((now - ctx->giveup_last_ms) < GIVEUP_LOG_INTERVAL_MS)) {
+		ctx->giveup_suppressed++;
+		return;
+	}
+	csp_print("%s[%s]: write() gave up after %u ms of back-off, errno %d (%s); packet dropped (%u more give-ups not logged)\n",
+			  __func__, ctx->name, (unsigned int)waited_ms, errnum, strerror(errnum), (unsigned int)ctx->giveup_suppressed);
+	ctx->giveup_last_ms = now ? now : 1;
+	ctx->giveup_suppressed = 0;
 }
 
 static void socketcan_free(can_context_t * ctx) {
@@ -122,16 +181,30 @@ static void * socketcan_rx_thread(void * arg) {
 		 * set CAN_ERR_FLAG and leave CAN_EFF_FLAG clear, so testing for a
 		 * standard id first would silently swallow every one of them. */
 		if (frame.can_id & CAN_ERR_FLAG) {
-			if ((frame.can_id & CAN_ERR_CRTL) && (frame.can_dlc > 1) && (frame.data[1] & CAN_ERR_CRTL_RX_OVERFLOW)) {
-				/* Dropped in hardware before reassembly: counted as rx_error
-				 * like a socket-queue drop. The damage to the packet being
-				 * reassembled is already counted under iface->frame. */
-				ctx->rx_overrun_count++;
-				ctx->iface.rx_error++;
-				csp_dbg_can_errno = CSP_DBG_CAN_ERR_RX_OVF;
+			if ((frame.can_id & CAN_ERR_CRTL) && (frame.can_dlc > 1)) {
+				if (frame.data[1] & CAN_ERR_CRTL_RX_OVERFLOW) {
+					/* Dropped in hardware before reassembly: counted as rx_error
+					 * like a socket-queue drop. The damage to the packet being
+					 * reassembled is already counted under iface->frame. */
+					ctx->rx_overrun_count++;
+					ctx->iface.rx_error++;
+					csp_dbg_can_errno = CSP_DBG_CAN_ERR_RX_OVF;
+				}
+				if (frame.data[1] & CAN_ERR_CRTL_TX_PASSIVE) {
+					/* TX error counter past 127: this node is not getting
+					 * ACKs. Transmits continue, slowly, so the send buffer
+					 * fills -- the usual prelude to tx_error. */
+					ctx->tx_passive_count++;
+				}
 			}
-			/* Bus errors, bus-off and restarts are reported by the kernel's
-			 * own link statistics; not logged here to keep the RX thread quiet. */
+			if (frame.can_id & CAN_ERR_BUSOFF) {
+				/* Everything queued is lost; the kernel restarts the
+				 * controller after the configured restart-ms. */
+				ctx->bus_off_count++;
+			}
+			/* Per-frame bus errors (lost arbitration, protocol violations)
+			 * are reported by the kernel's own link statistics; not counted
+			 * here to keep the RX thread cheap on a saturated bus. */
 			continue;
 		}
 
@@ -177,29 +250,35 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 		int written;
 
 		written = write(ctx->socket, (void *)pdata, length);
-		if (written < 0) {
-			if (errno == ENOBUFS) {
-				/* If no space available, wait for 5 ms and try again */
-				ctx->tx_enobufs_retries++;
-				usleep(5000);
-				waiting_ms += 5;
-			} else if(errno == EAGAIN || errno == EINTR) {
-				/* Acceptable, since something interrupted us, try again */
-				waiting_ms += 5;
-			} else {
-				csp_print("%s[%s]: write() failed, encountered an error during write(). %d - '%s'\n", __func__, ctx->name, errno, strerror(errno));
-				return CSP_ERR_TX;
-			}
-
-			if (waiting_ms >= 1000) {
-				/* We finally got tired of waiting, give up */
-				csp_print("%s[%s]: write() failed, we have been waiting for CAN buffers for too long (>1000 ms)\n", __func__, ctx->name);
-				return CSP_ERR_TX;
-			}
-		} else {
+		if (written >= 0) {
 			waiting_ms = 0;
 			pdata += written;
 			length -= written;
+			continue;
+		}
+
+		const int errnum = errno;
+		switch (csp_can_socketcan_tx_backoff(errnum, &waiting_ms)) {
+			case CSP_CAN_SOCKETCAN_TX_RETRY_NOW:
+				break;
+			case CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP:
+				/* The socket is non-blocking: ENOBUFS is the qdisc full,
+				 * EAGAIN the socket send buffer full. Either way the
+				 * controller is behind the offered load; wait for it. */
+				if (errnum == ENOBUFS) {
+					ctx->tx_enobufs_retries++;
+				} else {
+					ctx->tx_eagain_retries++;
+				}
+				usleep(CSP_CAN_SOCKETCAN_TX_BACKOFF_MS * 1000);
+				break;
+			case CSP_CAN_SOCKETCAN_TX_GIVE_UP:
+				socketcan_log_giveup(ctx, errnum, waiting_ms);
+				return CSP_ERR_TX;
+			case CSP_CAN_SOCKETCAN_TX_FAIL:
+			default:
+				csp_print("%s[%s]: write() failed, encountered an error during write(). %d - '%s'\n", __func__, ctx->name, errnum, strerror(errnum));
+				return CSP_ERR_TX;
 		}
 	}
 
@@ -356,6 +435,27 @@ int csp_can_socketcan_open_and_add_interface(const char * device, const char * i
 		csp_print("%s[%s]: bind() failed, error: %s\n", __func__, ctx->name, strerror(errno));
 		socketcan_free(ctx);
 		return CSP_ERR_INVAL;
+	}
+
+	/* Size the send buffer explicitly. The default (net.core.wmem_default,
+	 * ~212 KB) holds only a few hundred frames in flight, so on a busy bus
+	 * write() returns EAGAIN long before txqueuelen is reached. The kernel
+	 * doubles the request for bookkeeping and clamps it to net.core.wmem_max;
+	 * report the effective value so a clamp is visible at boot. */
+	{
+		int sndbuf = CSP_CAN_SOCKETCAN_SNDBUF_BYTES;
+		int got = 0;
+		socklen_t got_len = sizeof(got);
+		if (setsockopt(ctx->socket, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) < 0) {
+			csp_print("%s[%s]: SO_SNDBUF request failed: %s\n", __func__, ctx->name, strerror(errno));
+		} else if (getsockopt(ctx->socket, SOL_SOCKET, SO_SNDBUF, &got, &got_len) == 0) {
+			if (got < 2 * sndbuf) {
+				csp_print("%s[%s]: socket sndbuf CLAMPED to %d bytes (asked %d, expect %d) -- raise net.core.wmem_max to at least %d\n",
+						  __func__, ctx->name, got, sndbuf, 2 * sndbuf, sndbuf);
+			} else {
+				csp_print("%s[%s]: socket sndbuf %d bytes (asked %d)\n", __func__, ctx->name, got, sndbuf);
+			}
+		}
 	}
 
 	/* Ask for controller error frames, restricted to controller state so a

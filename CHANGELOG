@@ -10,6 +10,9 @@ libcsp 2.2, xx-xx-202x
 - new: csp_can_rx_timeout_count() counts partial packets discarded by the reassembly timeout
 - new: csp_can_socketcan_tx_enobufs_count() and csp_can_socketcan_rx_overrun_count() driver counters
 - fix: socketcan non-promiscuous filter accepts CSP 1.x broadcast frames
+- new: csp_can_socketcan_tx_backoff() is the socketcan TX retry policy, with csp_can_socketcan_tx_eagain_count(), csp_can_socketcan_bus_off_count() and csp_can_socketcan_tx_passive_count() driver counters
+- fix: socketcan TX backs off on EAGAIN (socket send buffer full) as it does on ENOBUFS, instead of retrying without sleeping and abandoning the packet within a millisecond while logging a one-second wait
+- improvement: socketcan requests SO_SNDBUF at open and reports the effective size; the give-up log carries errno and elapsed back-off and is rate limited per interface
 - improvement: Small Fragmentation Protocol has been reworked to remove malloc() (#742)
 - improvement: PyCSP can now be built without SocketCAN (#638)
 - improvement: PyCSP can now take mask and is_default optional parameter (#924)
