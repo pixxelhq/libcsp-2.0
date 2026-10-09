@@ -598,6 +598,44 @@ START_TEST(test_socketcan_backoff_hard_error_fails_immediately)
 }
 END_TEST
 
+/* RX thread scheduling request is a process-wide setting for interfaces
+ * opened afterwards; negative values are nonsense and read back as default. */
+START_TEST(test_socketcan_rx_priority_setting)
+{
+	ck_assert_int_eq(csp_can_socketcan_rx_priority(), 0);
+	csp_can_socketcan_set_rx_priority(93);
+	ck_assert_int_eq(csp_can_socketcan_rx_priority(), 93);
+	csp_can_socketcan_set_rx_priority(-5);
+	ck_assert_int_eq(csp_can_socketcan_rx_priority(), 0);
+}
+END_TEST
+
+/* Socket-to-read latency arithmetic, including the guards against a clock
+ * step (negative or absurd differences read as 0, not as a late frame). */
+START_TEST(test_socketcan_latency_us)
+{
+	struct timespec rx = {.tv_sec = 100, .tv_nsec = 500000000};
+	struct timespec now = {.tv_sec = 100, .tv_nsec = 750000000};
+	ck_assert_uint_eq(csp_can_socketcan_latency_us(&rx, &now), 250000);
+	now.tv_sec = 101; now.tv_nsec = 200000000;                 /* 0.7 s later */
+	ck_assert_uint_eq(csp_can_socketcan_latency_us(&rx, &now), 700000);
+	ck_assert_uint_eq(csp_can_socketcan_latency_us(&now, &rx), 0);  /* rx after now */
+	now.tv_sec = 100 + 7200;                                     /* clock step */
+	ck_assert_uint_eq(csp_can_socketcan_latency_us(&rx, &now), 0);
+	ck_assert_uint_eq(csp_can_socketcan_latency_us(NULL, &now), 0);
+}
+END_TEST
+
+START_TEST(test_socketcan_latency_counters_zero_for_foreign_iface)
+{
+	can_test_init(1);
+	ck_assert_uint_eq(csp_can_socketcan_rx_latency_max_us(&rx_iface, true), 0);
+	ck_assert_uint_eq(csp_can_socketcan_rx_late_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_rx_latency_max_us(NULL, false), 0);
+	ck_assert_uint_eq(csp_can_socketcan_rx_late_count(NULL), 0);
+}
+END_TEST
+
 #endif /* CSP_HAVE_LIBSOCKETCAN */
 
 Suite * can_suite(void) {
@@ -634,6 +672,9 @@ Suite * can_suite(void) {
 	tcase_add_test(tc, test_socketcan_backoff_enobufs_same_policy);
 	tcase_add_test(tc, test_socketcan_backoff_eintr_is_free);
 	tcase_add_test(tc, test_socketcan_backoff_hard_error_fails_immediately);
+	tcase_add_test(tc, test_socketcan_rx_priority_setting);
+	tcase_add_test(tc, test_socketcan_latency_us);
+	tcase_add_test(tc, test_socketcan_latency_counters_zero_for_foreign_iface);
 #endif
 
 	suite_add_tcase(s, tc);

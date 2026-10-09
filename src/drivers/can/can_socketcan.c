@@ -22,6 +22,8 @@
 #include <csp/csp.h>
 #include <csp/csp_id.h>
 #include <csp/arch/csp_time.h>
+#include <sched.h>
+#include <time.h>
 
 /* A give-up is logged at most this often per interface. A starved sender
  * abandons packets in bursts, and one line per packet flooded the FSW logger. */
@@ -41,7 +43,32 @@ typedef struct {
 	uint32_t tx_passive_count;   /**< CAN_ERR_CRTL_TX_PASSIVE error frames, see csp_can_socketcan_tx_passive_count() */
 	uint32_t giveup_last_ms;     /**< csp_get_ms() of the last give-up line printed, 0 = never */
 	uint32_t giveup_suppressed;  /**< give-ups not printed since giveup_last_ms */
+	uint32_t rx_latency_max_us;  /**< max socket-to-read latency since last reset, see csp_can_socketcan_rx_latency_max_us() */
+	uint32_t rx_late_count;      /**< frames read more than CSP_CAN_PBUF_TIMEOUT_MS after the kernel stamped them */
+	bool rx_timestamps;          /**< SO_TIMESTAMPNS accepted on this socket */
 } can_context_t;
+
+/* SCHED_FIFO priority for RX threads created from now on; 0 = default attributes */
+static int rx_thread_priority = 0;
+
+void csp_can_socketcan_set_rx_priority(int priority) {
+	rx_thread_priority = (priority < 0) ? 0 : priority;
+}
+
+int csp_can_socketcan_rx_priority(void) {
+	return rx_thread_priority;
+}
+
+uint32_t csp_can_socketcan_latency_us(const struct timespec * rx, const struct timespec * now) {
+	if ((rx == NULL) || (now == NULL)) {
+		return 0;
+	}
+	int64_t us = ((int64_t)now->tv_sec - (int64_t)rx->tv_sec) * 1000000LL + ((int64_t)now->tv_nsec - (int64_t)rx->tv_nsec) / 1000LL;
+	if ((us <= 0) || (us > 3600LL * 1000000LL)) {
+		return 0;
+	}
+	return (uint32_t)us;
+}
 
 static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t * packet);
 
@@ -86,6 +113,23 @@ uint32_t csp_can_socketcan_bus_off_count(const csp_iface_t * iface) {
 uint32_t csp_can_socketcan_tx_passive_count(const csp_iface_t * iface) {
 	const can_context_t * ctx = socketcan_ctx(iface);
 	return ctx ? ctx->tx_passive_count : 0;
+}
+
+uint32_t csp_can_socketcan_rx_latency_max_us(const csp_iface_t * iface, bool reset) {
+	can_context_t * ctx = (can_context_t *)socketcan_ctx(iface);
+	if (ctx == NULL) {
+		return 0;
+	}
+	const uint32_t v = ctx->rx_latency_max_us;
+	if (reset) {
+		ctx->rx_latency_max_us = 0;
+	}
+	return v;
+}
+
+uint32_t csp_can_socketcan_rx_late_count(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->rx_late_count : 0;
 }
 
 csp_can_socketcan_tx_action_t csp_can_socketcan_tx_backoff(int errnum, uint32_t * waiting_ms) {
@@ -153,9 +197,29 @@ static void * socketcan_rx_thread(void * arg) {
 			continue;
 		}
 
-		/* Read CAN frame */
+		/* Read CAN frame, with the kernel receive timestamp when available */
 		struct can_frame frame;
-		int nbytes = read(ctx->socket, &frame, sizeof(frame)); 
+		struct iovec iov = {.iov_base = &frame, .iov_len = sizeof(frame)};
+		union { struct cmsghdr align; char buf[CMSG_SPACE(sizeof(struct timespec))]; } cmsgbuf;
+		struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = ctx->rx_timestamps ? cmsgbuf.buf : NULL, .msg_controllen = ctx->rx_timestamps ? sizeof(cmsgbuf.buf) : 0};
+		int nbytes = recvmsg(ctx->socket, &msg, 0);
+		if (nbytes > 0 && ctx->rx_timestamps) {
+			for (struct cmsghdr * c = CMSG_FIRSTHDR(&msg); c != NULL; c = CMSG_NXTHDR(&msg, c)) {
+				if ((c->cmsg_level == SOL_SOCKET) && (c->cmsg_type == SCM_TIMESTAMPNS)) {
+					struct timespec rx_ts, now;
+					memcpy(&rx_ts, CMSG_DATA(c), sizeof(rx_ts));
+					clock_gettime(CLOCK_REALTIME, &now);
+					const uint32_t lat = csp_can_socketcan_latency_us(&rx_ts, &now);
+					if (lat > ctx->rx_latency_max_us) {
+						ctx->rx_latency_max_us = lat;
+					}
+					if (lat > (uint32_t)CSP_CAN_PBUF_TIMEOUT_MS * 1000U) {
+						ctx->rx_late_count++;
+					}
+					break;
+				}
+			}
+		}
 		if (nbytes < 0) {
 			if (errno == EAGAIN || errno == EINTR) {
 				/* This is acceptable, since something interrupted us, try again */
@@ -458,6 +522,17 @@ int csp_can_socketcan_open_and_add_interface(const char * device, const char * i
 		}
 	}
 
+	/* Kernel receive timestamps, so the RX thread can measure how long each
+	 * frame waited in the socket before it was read: the one number that
+	 * tells a starved RX thread from a slow bus. */
+	{
+		int on = 1;
+		ctx->rx_timestamps = (setsockopt(ctx->socket, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)) == 0);
+		if (!ctx->rx_timestamps) {
+			csp_print("%s[%s]: SO_TIMESTAMPNS not available, RX latency will read 0: %s\n", __func__, ctx->name, strerror(errno));
+		}
+	}
+
 	/* Ask for controller error frames, restricted to controller state so a
 	 * busy bus does not become a per-frame firehose. Without this a
 	 * controller RX overrun is invisible: it is reported only this way. */
@@ -481,9 +556,38 @@ int csp_can_socketcan_open_and_add_interface(const char * device, const char * i
 		return res;
 	}
 
-	/* Create receive thread */
-	if (pthread_create(&ctx->rx_thread, NULL, socketcan_rx_thread, ctx) != 0) {
-		csp_print("%s[%s]: pthread_create() failed, error: %s\n", __func__, ctx->name, strerror(errno));
+	/* Create receive thread. SCHED_FIFO when asked for (see
+	 * csp_can_socketcan_set_rx_priority); a refusal -- typically EPERM
+	 * without CAP_SYS_NICE -- falls back to default attributes rather than
+	 * failing the interface. */
+	int created = -1;
+	if (rx_thread_priority > 0) {
+		pthread_attr_t attr;
+		struct sched_param sp;
+		const int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
+		int prio = rx_thread_priority;
+		if ((lo >= 0) && (prio < lo)) prio = lo;
+		if ((hi >= 0) && (prio > hi)) prio = hi;
+		memset(&sp, 0, sizeof(sp));
+		sp.sched_priority = prio;
+		if ((pthread_attr_init(&attr) == 0) &&
+			(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0) &&
+			(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0) &&
+			(pthread_attr_setschedparam(&attr, &sp) == 0)) {
+			created = pthread_create(&ctx->rx_thread, &attr, socketcan_rx_thread, ctx);
+			if (created == 0) {
+				csp_print("%s[%s]: RX thread SCHED_FIFO priority %d\n", __func__, ctx->name, prio);
+			} else {
+				csp_print("%s[%s]: SCHED_FIFO %d refused for the RX thread (%s), using default scheduling\n", __func__, ctx->name, prio, strerror(created));
+			}
+		}
+		pthread_attr_destroy(&attr);
+	}
+	if (created != 0) {
+		created = pthread_create(&ctx->rx_thread, NULL, socketcan_rx_thread, ctx);
+	}
+	if (created != 0) {
+		csp_print("%s[%s]: pthread_create() failed, error: %s\n", __func__, ctx->name, strerror(created));
 		(void)csp_can_remove_interface(&ctx->iface);
 		socketcan_free(ctx);
 		return CSP_ERR_NOMEM;

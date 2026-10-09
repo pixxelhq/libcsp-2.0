@@ -9,6 +9,7 @@
 
 #include <csp/interfaces/csp_if_can.h>
 #include <linux/can.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -142,6 +143,50 @@ uint32_t csp_can_socketcan_bus_off_count(const csp_iface_t * iface);
  * @return count, 0 for NULL or a non-socketcan interface.
  */
 uint32_t csp_can_socketcan_tx_passive_count(const csp_iface_t * iface);
+
+/**
+ * Scheduling for the receive thread of every interface opened AFTER this call.
+ *
+ * The RX thread was created with default attributes, i.e. SCHED_OTHER, the
+ * lowest class in a process whose rate groups run SCHED_FIFO. Whenever those
+ * are busy for longer than the reassembly timeout the thread does not run,
+ * frames queue in the socket, and every packet in flight times out at the
+ * receiver although nothing was lost on the wire. With @p priority > 0 the
+ * thread is created SCHED_FIFO at that priority (clamped to the policy's
+ * range); if the kernel refuses (no CAP_SYS_NICE) the driver logs once and
+ * falls back to the default attributes. 0 restores the default.
+ *
+ * @param[in] priority SCHED_FIFO priority, 0 = default scheduling
+ */
+void csp_can_socketcan_set_rx_priority(int priority);
+
+/** @return the value last given to csp_can_socketcan_set_rx_priority(), 0 by default */
+int csp_can_socketcan_rx_priority(void);
+
+/**
+ * Socket-to-read latency: kernel receive timestamp (SO_TIMESTAMPNS) to the
+ * moment the RX thread read the frame, in microseconds. This is the time a
+ * frame spent queued because the RX thread was not running. Returns the
+ * maximum observed since the previous call with @p reset, and clears it when
+ * @p reset is true, so a periodic reader gets one maximum per period.
+ * @return microseconds, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_rx_latency_max_us(const csp_iface_t * iface, bool reset);
+
+/**
+ * Frames whose socket-to-read latency exceeded CSP_CAN_PBUF_TIMEOUT_MS: each
+ * one is a frame that reached the controller in time and was then held in the
+ * socket long enough to time out the reassembly it belonged to.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_rx_late_count(const csp_iface_t * iface);
+
+/**
+ * Pure helper behind the latency counters: @p now - @p rx in microseconds,
+ * 0 if @p rx is not before @p now or the difference is implausible (> 1 h,
+ * which only a clock step produces).
+ */
+uint32_t csp_can_socketcan_latency_us(const struct timespec * rx, const struct timespec * now);
 
 /**
  * Controller RX FIFO overruns (CAN_ERR_CRTL_RX_OVERFLOW) seen on this interface.
