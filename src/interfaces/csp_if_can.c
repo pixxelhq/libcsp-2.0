@@ -9,6 +9,7 @@
 
 #include "csp/csp_types.h"
 #include "csp_if_can_pbuf.h"
+#include <csp/arch/csp_time.h>
 
 /**
  * TESTING:
@@ -41,6 +42,94 @@ enum cfp_frame_t {
 	/* Remaining CFP fragment(s) of a CSP packet */
 	CFP_MORE = 1
 };
+
+#if (CSP_CFP_OUT_OF_ORDER_RX)
+static int csp_can1_rx_unordered(csp_iface_t * iface, csp_can_interface_data_t * ifdata, csp_packet_t * packet, uint32_t id, const uint8_t * data, uint8_t dlc, int * task_woken);
+static int csp_can2_rx_unordered(csp_iface_t * iface, csp_can_interface_data_t * ifdata, csp_packet_t * packet, uint32_t id, const uint8_t * data, uint8_t dlc, uint32_t timestamp_rx, int * task_woken);
+#endif
+
+#if (CSP_CFP_OUT_OF_ORDER_RX) && (CSP_CAN_EARLY_FRAGMENTS > 0)
+
+/* How long a fragment waits for its BEGIN. Measured driver reordering is a
+ * few frame times (tens of microseconds to ~13 ms); anything older is a
+ * genuine orphan. */
+#define CSP_CAN_EARLY_HOLD_MS 100
+
+/*
+ * Keep a MORE fragment that has no open packet. Slots: a free one, else one
+ * whose fragment has waited past the hold time (that fragment was a real
+ * orphan and is counted as the frame error it always was), else the oldest.
+ */
+static void csp_can_early_hold(csp_iface_t * iface, csp_can_interface_data_t * ifdata, uint32_t id, const uint8_t * data, uint8_t dlc, uint32_t timestamp_rx, int * task_woken) {
+
+	const uint32_t now = (task_woken) ? csp_get_ms_isr() : csp_get_ms();
+	csp_can_early_t * slot = NULL;
+	csp_can_early_t * oldest = NULL;
+
+	for (unsigned int i = 0; i < CSP_CAN_EARLY_FRAGMENTS; i++) {
+		csp_can_early_t * e = &ifdata->early[i];
+		if (!e->used) {
+			if (slot == NULL) slot = e;
+			continue;
+		}
+		if ((now - e->t_ms) > CSP_CAN_EARLY_HOLD_MS) {
+			e->used = 0;
+			iface->frame++;
+			ifdata->early_expired++;
+			if (slot == NULL) slot = e;
+			continue;
+		}
+		if ((oldest == NULL) || ((int32_t)(e->t_ms - oldest->t_ms) < 0)) oldest = e;
+	}
+	if (slot == NULL) {
+		slot = oldest;
+		iface->frame++;
+		ifdata->early_expired++;
+	}
+
+	slot->used = 1;
+	slot->id = id;
+	slot->t_ms = now;
+	slot->timestamp_rx = timestamp_rx;
+	slot->dlc = (dlc > sizeof(slot->data)) ? sizeof(slot->data) : dlc;
+	memcpy(slot->data, data, slot->dlc);
+}
+
+/*
+ * A BEGIN just opened a packet: feed it every held fragment of the same
+ * packet. The packet is looked up again before each one, since a fragment
+ * can complete it (or a mismatch discard it) part-way through.
+ */
+static void csp_can_early_replay(csp_iface_t * iface, csp_can_interface_data_t * ifdata, uint32_t id, uint32_t mask, int version, int * task_woken) {
+
+	unsigned int replayed = 0;
+
+	for (unsigned int i = 0; i < CSP_CAN_EARLY_FRAGMENTS; i++) {
+		csp_can_early_t * e = &ifdata->early[i];
+		if (!e->used || ((e->id & mask) != (id & mask))) {
+			continue;
+		}
+		e->used = 0;
+		csp_packet_t * packet = csp_can_pbuf_find(ifdata, e->id, mask, task_woken);
+		if (packet == NULL) {
+			continue;
+		}
+		if (version == 1) {
+			csp_can1_rx_unordered(iface, ifdata, packet, e->id, e->data, e->dlc, task_woken);
+		} else {
+			csp_can2_rx_unordered(iface, ifdata, packet, e->id, e->data, e->dlc, e->timestamp_rx, task_woken);
+		}
+		replayed++;
+	}
+	if (replayed > 0) {
+		ifdata->early_rescued++;
+	}
+}
+
+#define CSP_CAN_EARLY_ENABLED 1
+#else
+#define CSP_CAN_EARLY_ENABLED 0
+#endif /* CSP_CFP_OUT_OF_ORDER_RX && CSP_CAN_EARLY_FRAGMENTS */
 
 /* Hand a fully reassembled CFP 1.x packet to the router */
 static void csp_can1_rx_complete(csp_iface_t * iface, csp_can_interface_data_t * ifdata, csp_packet_t * packet, int * task_woken) {
@@ -186,13 +275,28 @@ static int csp_can1_rx(csp_iface_t * iface, uint32_t id, const uint8_t * data, u
 			memcpy(packet->frame_begin, data, CFP1_CSP_HEADER_SIZE);
 			packet->frame_length += CFP1_CSP_HEADER_SIZE;
 		} else {
+#if CSP_CAN_EARLY_ENABLED
+			/* A MORE before its BEGIN: the driver delivered out of bus order.
+			 * Hold it; the BEGIN replays it. */
+			csp_can_early_hold(iface, ifdata, id, data, dlc, 0, task_woken);
+			return CSP_ERR_NONE;
+#else
 			iface->frame++;
 			return CSP_ERR_INVAL;
+#endif
 		}
 	}
 
 #if (CSP_CFP_OUT_OF_ORDER_RX)
-	return csp_can1_rx_unordered(iface, ifdata, packet, id, data, dlc, task_woken);
+	{
+		const int ret = csp_can1_rx_unordered(iface, ifdata, packet, id, data, dlc, task_woken);
+#if CSP_CAN_EARLY_ENABLED
+		if (CFP_TYPE(id) == CFP_BEGIN) {
+			csp_can_early_replay(iface, ifdata, id, CFP_ID_CONN_MASK, 1, task_woken);
+		}
+#endif
+		return ret;
+	}
 #else
 	/* Reset frame data offset */
 	uint8_t offset = 0;
@@ -563,13 +667,26 @@ static int csp_can2_rx(csp_iface_t * iface, uint32_t id, const uint8_t * data, u
 				return ret;
 			}
 		} else {
+#if CSP_CAN_EARLY_ENABLED
+			csp_can_early_hold(iface, ifdata, id, data, dlc, timestamp_rx, task_woken);
+			return CSP_ERR_NONE;
+#else
 			iface->frame++;
 			return CSP_ERR_INVAL;
+#endif
 		}
 	}
 
 #if (CSP_CFP_OUT_OF_ORDER_RX)
-	return csp_can2_rx_unordered(iface, ifdata, packet, id, data, dlc, timestamp_rx, task_woken);
+	{
+		const int ret = csp_can2_rx_unordered(iface, ifdata, packet, id, data, dlc, timestamp_rx, task_woken);
+#if CSP_CAN_EARLY_ENABLED
+		if (id & (CFP2_BEGIN_MASK << CFP2_BEGIN_OFFSET)) {
+			csp_can_early_replay(iface, ifdata, id, CFP2_ID_CONN_MASK, 2, task_woken);
+		}
+#endif
+		return ret;
+	}
 #else
 
 	/* FRAGMENT */
@@ -728,6 +845,20 @@ uint32_t csp_can_rx_timeout_count(const csp_iface_t * iface) {
 		return 0;
 	}
 	return ((const csp_can_interface_data_t *)iface->interface_data)->rx_timeouts;
+}
+
+uint32_t csp_can_rx_reorder_rescued_count(const csp_iface_t * iface) {
+	if (!csp_can_is_can_interface(iface)) {
+		return 0;
+	}
+	return ((const csp_can_interface_data_t *)iface->interface_data)->early_rescued;
+}
+
+uint32_t csp_can_rx_early_expired_count(const csp_iface_t * iface) {
+	if (!csp_can_is_can_interface(iface)) {
+		return 0;
+	}
+	return ((const csp_can_interface_data_t *)iface->interface_data)->early_expired;
 }
 
 int csp_can_add_interface(csp_iface_t * iface) {

@@ -65,6 +65,11 @@ static void can_test_init(unsigned int version) {
 	rx_ifdata.pbufs = NULL;
 	tx_ifdata.tx_func = capture_tx;
 	rx_ifdata.tx_func = capture_tx;
+	rx_ifdata.early_rescued = rx_ifdata.early_expired = 0;
+	rx_ifdata.rx_timeouts = 0;
+#if (CSP_CFP_OUT_OF_ORDER_RX) && (CSP_CAN_EARLY_FRAGMENTS > 0)
+	memset(rx_ifdata.early, 0, sizeof(rx_ifdata.early));
+#endif
 	tx_iface.frame = tx_iface.rx_error = tx_iface.drop = 0;
 	rx_iface.frame = rx_iface.rx_error = rx_iface.drop = 0;
 
@@ -435,6 +440,100 @@ START_TEST(test_send_direct_iface_forces_interface)
 }
 END_TEST
 
+#if (CSP_CFP_OUT_OF_ORDER_RX) && (CSP_CAN_EARLY_FRAGMENTS > 0)
+
+/* The receiving driver on the bench delivers a BEGIN after one or more of
+ * its MORE fragments. Those used to be discarded (frame errors) and the
+ * packet then timed out; now they are held and replayed. */
+START_TEST(test_can_v1_begin_after_more_is_rescued)
+{
+	static const unsigned int order[] = {1, 2, 0, 3, 4, 5, 6};
+	static const unsigned int tail_first[] = {1, 2, 3, 4, 5, 6, 0};
+
+	can_test_init(1);
+	send_packet(48);
+	ck_assert_uint_eq(frame_count, 7);
+	feed(order, 7);
+	expect_delivered(48);
+	ck_assert_uint_eq(rx_iface.frame, 0);
+	ck_assert_uint_eq(csp_can_rx_reorder_rescued_count(&rx_iface), 1);
+	ck_assert_uint_eq(csp_can_rx_early_expired_count(&rx_iface), 0);
+
+	/* The whole tail before the BEGIN, then an ordered packet: both deliver */
+	send_packet(48);
+	feed(tail_first, 7);
+	expect_delivered(48);
+	send_packet(20);
+	feed_all();
+	expect_delivered(20);
+	ck_assert_uint_eq(rx_iface.frame, 0);
+	ck_assert_uint_eq(csp_can_rx_reorder_rescued_count(&rx_iface), 2);
+}
+END_TEST
+
+START_TEST(test_can_v2_begin_after_more_is_rescued)
+{
+	static const unsigned int order[] = {1, 0, 2, 3, 4, 5, 6};
+
+	can_test_init(2);
+	send_packet(48);
+	ck_assert_uint_eq(frame_count, 7);
+	feed(order, 7);
+	expect_delivered(48);
+	ck_assert_uint_eq(rx_iface.frame, 0);
+	ck_assert_uint_eq(csp_can_rx_reorder_rescued_count(&rx_iface), 1);
+}
+END_TEST
+
+/* A held fragment that no BEGIN claims is still the orphan it always was:
+ * once the hold time has passed it is counted as a frame error and its slot
+ * reused, so a stale fragment can never block a later packet. */
+START_TEST(test_can_v1_unclaimed_early_fragment_expires)
+{
+	static const unsigned int only_more[] = {1};
+	static const unsigned int order[] = {1, 0, 2, 3, 4, 5, 6};
+
+	can_test_init(1);
+	send_packet(48);
+	feed(only_more, 1);
+	expect_nothing();
+	ck_assert_uint_eq(rx_iface.frame, 0);
+
+	usleep(150 * 1000); /* past CSP_CAN_EARLY_HOLD_MS */
+
+	/* Another packet's early fragment triggers the sweep; the packet itself completes */
+	send_packet(48);
+	feed(order, 7);
+	expect_delivered(48);
+	ck_assert_uint_eq(rx_iface.frame, 1);
+	ck_assert_uint_eq(csp_can_rx_early_expired_count(&rx_iface), 1);
+	ck_assert_uint_eq(csp_can_rx_reorder_rescued_count(&rx_iface), 1);
+}
+END_TEST
+
+/* More early fragments than slots: the oldest gives way, counted as lost */
+START_TEST(test_can_v1_early_fragments_bounded)
+{
+	static const unsigned int only_more[] = {1};
+	static const unsigned int rest[] = {0, 2};
+
+	can_test_init(1);
+	for (unsigned int i = 0; i < CSP_CAN_EARLY_FRAGMENTS + 1; i++) {
+		send_packet(16);
+		feed(only_more, 1);
+	}
+	ck_assert_uint_eq(rx_iface.frame, 1);
+	ck_assert_uint_eq(csp_can_rx_early_expired_count(&rx_iface), 1);
+	ck_assert_int_eq(csp_buffer_remaining(), baseline);
+
+	/* The newest held fragment is still there: its packet completes */
+	feed(rest, 2);
+	expect_delivered(16);
+}
+END_TEST
+
+#endif /* early fragments */
+
 #if (CSP_HAVE_LIBSOCKETCAN)
 
 static int count_matches(uint32_t id, const struct can_filter * f, int n) {
@@ -661,6 +760,12 @@ Suite * can_suite(void) {
 
 	tcase_add_test(tc, test_can_v1_missing_fragment_counts_timeout);
 	tcase_add_test(tc, test_send_direct_iface_forces_interface);
+#if (CSP_CFP_OUT_OF_ORDER_RX) && (CSP_CAN_EARLY_FRAGMENTS > 0)
+	tcase_add_test(tc, test_can_v1_begin_after_more_is_rescued);
+	tcase_add_test(tc, test_can_v2_begin_after_more_is_rescued);
+	tcase_add_test(tc, test_can_v1_unclaimed_early_fragment_expires);
+	tcase_add_test(tc, test_can_v1_early_fragments_bounded);
+#endif
 #if (CSP_HAVE_LIBSOCKETCAN)
 	tcase_add_test(tc, test_socketcan_filters_v1_own_or_broadcast);
 	tcase_add_test(tc, test_socketcan_filters_v1_broadcast_address_collapses);

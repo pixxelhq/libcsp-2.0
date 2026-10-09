@@ -199,6 +199,27 @@ extern "C" {
  */
 typedef int (*csp_can_driver_tx_t)(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t * packet);
 
+#ifndef CSP_CAN_EARLY_FRAGMENTS
+#define CSP_CAN_EARLY_FRAGMENTS 0
+#endif
+
+#if (CSP_CFP_OUT_OF_ORDER_RX) && (CSP_CAN_EARLY_FRAGMENTS > 0)
+/**
+ * A MORE fragment delivered before the BEGIN of its packet, held until that
+ * BEGIN arrives. A driver that drains its receive buffers in buffer order
+ * rather than arrival order produces these under load; on the bus itself a
+ * BEGIN is never overtaken by its own MOREs (it has the lower identifier).
+ */
+typedef struct {
+	uint32_t id;           /**< CAN identifier, used to match the BEGIN */
+	uint32_t t_ms;         /**< csp_get_ms() when held */
+	uint32_t timestamp_rx; /**< driver timestamp, replayed with the fragment */
+	uint8_t dlc;
+	uint8_t used;
+	uint8_t data[8];
+} csp_can_early_t;
+#endif
+
 /**
  * Interface data (state information).
  */
@@ -212,6 +233,11 @@ typedef struct {
 	csp_can_driver_tx_t tx_func; /**< Tx function */
 	csp_packet_t * pbufs; /**< PBUF queue */
 	uint32_t rx_timeouts; /**< Partial packets discarded by the reassembly timeout, see csp_can_rx_timeout_count() */
+	uint32_t early_rescued; /**< Packets completed with fragments that arrived before their BEGIN, see csp_can_rx_reorder_rescued_count() */
+	uint32_t early_expired; /**< Held fragments no BEGIN ever claimed, see csp_can_rx_early_expired_count() */
+#if (CSP_CFP_OUT_OF_ORDER_RX) && (CSP_CAN_EARLY_FRAGMENTS > 0)
+	csp_can_early_t early[CSP_CAN_EARLY_FRAGMENTS]; /**< Fragments waiting for their BEGIN */
+#endif
 } csp_can_interface_data_t;
 
 /**
@@ -286,6 +312,24 @@ int csp_can_is_can_interface(const csp_iface_t * iface);
  * @return timeout count, 0 for NULL or a non-CAN interface.
  */
 uint32_t csp_can_rx_timeout_count(const csp_iface_t * iface);
+
+/**
+ * Packets that were completed only because one or more of their MORE
+ * fragments arrived before the BEGIN and were held (CSP_CAN_EARLY_FRAGMENTS)
+ * instead of discarded. Non-zero means the receiving driver delivers frames
+ * out of bus order; each such packet would previously have cost a frame error
+ * per early fragment plus a reassembly timeout.
+ * @return count, 0 for a non-CAN interface.
+ */
+uint32_t csp_can_rx_reorder_rescued_count(const csp_iface_t * iface);
+
+/**
+ * Held fragments that no BEGIN claimed within the hold time, or that were
+ * pushed out by newer ones. Each is also counted under csp_iface_t::frame,
+ * as a discarded orphan fragment always was.
+ * @return count, 0 for a non-CAN interface.
+ */
+uint32_t csp_can_rx_early_expired_count(const csp_iface_t * iface);
 
 #ifdef __cplusplus
 }
