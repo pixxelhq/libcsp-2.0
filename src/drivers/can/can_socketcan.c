@@ -522,6 +522,27 @@ int csp_can_socketcan_open_and_add_interface(const char * device, const char * i
 		}
 	}
 
+	/* Size the receive buffer explicitly as well. Without this the socket
+	 * inherits net.core.rmem_default (~212 KB, ~13k frames at the socketcan
+	 * skb cost) and depends on a sysctl the deploy flow has to remember;
+	 * with it the only knob is net.core.rmem_max, and a clamp is visible at
+	 * boot. The kernel doubles the request as it does for SO_SNDBUF. */
+	{
+		int rcvbuf = CSP_CAN_SOCKETCAN_RCVBUF_BYTES;
+		int got = 0;
+		socklen_t got_len = sizeof(got);
+		if (setsockopt(ctx->socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) < 0) {
+			csp_print("%s[%s]: SO_RCVBUF request failed: %s\n", __func__, ctx->name, strerror(errno));
+		} else if (getsockopt(ctx->socket, SOL_SOCKET, SO_RCVBUF, &got, &got_len) == 0) {
+			if (got < 2 * rcvbuf) {
+				csp_print("%s[%s]: socket rcvbuf CLAMPED to %d bytes (asked %d, expect %d) -- raise net.core.rmem_max to at least %d\n",
+						  __func__, ctx->name, got, rcvbuf, 2 * rcvbuf, rcvbuf);
+			} else {
+				csp_print("%s[%s]: socket rcvbuf %d bytes (asked %d)\n", __func__, ctx->name, got, rcvbuf);
+			}
+		}
+	}
+
 	/* Kernel receive timestamps, so the RX thread can measure how long each
 	 * frame waited in the socket before it was read: the one number that
 	 * tells a starved RX thread from a slow bus. */

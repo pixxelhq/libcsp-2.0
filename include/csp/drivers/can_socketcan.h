@@ -84,6 +84,8 @@ int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t net
 #define CSP_CAN_SOCKETCAN_TX_BUDGET_MS 1000
 /** SO_SNDBUF requested at open. The kernel clamps it to net.core.wmem_max. */
 #define CSP_CAN_SOCKETCAN_SNDBUF_BYTES (4 * 1024 * 1024)
+/** SO_RCVBUF requested at open. The kernel clamps it to net.core.rmem_max. */
+#define CSP_CAN_SOCKETCAN_RCVBUF_BYTES (4 * 1024 * 1024)
 
 /** What csp_can_socketcan_tx_backoff() tells the transmit loop to do next. */
 typedef enum {
