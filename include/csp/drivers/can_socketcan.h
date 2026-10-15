@@ -80,7 +80,11 @@ int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t net
 
 /** Sleep between two attempts to write a frame the kernel would not take. */
 #define CSP_CAN_SOCKETCAN_TX_BACKOFF_MS 5
-/** Total back-off a single frame may spend before the packet is abandoned. */
+/** Total back-off a single frame may spend before the packet is abandoned.
+ *  Fallback only: a packet whose csp_packet_t::timestamp_tx holds a
+ *  csp_get_ms() deadline is abandoned as soon as that deadline passes, whatever
+ *  frame it is on. Stamp it before csp_send_direct_iface() to bound how long a
+ *  send may block the calling thread (CFP1 checks it on every frame). */
 #define CSP_CAN_SOCKETCAN_TX_BUDGET_MS 1000
 /** SO_SNDBUF requested at open. The kernel clamps it to net.core.wmem_max. */
 #define CSP_CAN_SOCKETCAN_SNDBUF_BYTES (4 * 1024 * 1024)
@@ -129,6 +133,14 @@ uint32_t csp_can_socketcan_tx_enobufs_count(const csp_iface_t * iface);
  * @return count, 0 for NULL or a non-socketcan interface.
  */
 uint32_t csp_can_socketcan_tx_eagain_count(const csp_iface_t * iface);
+
+/**
+ * Packets abandoned because the deadline in csp_packet_t::timestamp_tx passed
+ * while the kernel was refusing frames (see CSP_CAN_SOCKETCAN_TX_BUDGET_MS).
+ * Each one is also counted under csp_iface_t::tx_error.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_tx_deadline_giveup_count(const csp_iface_t * iface);
 
 /**
  * CAN_ERR_BUSOFF error frames: the controller left the bus. With a restart

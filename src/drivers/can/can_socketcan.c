@@ -38,6 +38,7 @@ typedef struct {
 	int socket;
 	uint32_t tx_enobufs_retries; /**< write() backoffs on ENOBUFS, see csp_can_socketcan_tx_enobufs_count() */
 	uint32_t tx_eagain_retries;  /**< write() backoffs on EAGAIN, see csp_can_socketcan_tx_eagain_count() */
+	uint32_t tx_deadline_giveups; /**< packets abandoned because their timestamp_tx deadline passed, see csp_can_socketcan_tx_deadline_giveup_count() */
 	uint32_t rx_overrun_count;   /**< CAN_ERR_CRTL_RX_OVERFLOW error frames, see csp_can_socketcan_rx_overrun_count() */
 	uint32_t bus_off_count;      /**< CAN_ERR_BUSOFF error frames, see csp_can_socketcan_bus_off_count() */
 	uint32_t tx_passive_count;   /**< CAN_ERR_CRTL_TX_PASSIVE error frames, see csp_can_socketcan_tx_passive_count() */
@@ -103,6 +104,11 @@ uint32_t csp_can_socketcan_rx_overrun_count(const csp_iface_t * iface) {
 uint32_t csp_can_socketcan_tx_eagain_count(const csp_iface_t * iface) {
 	const can_context_t * ctx = socketcan_ctx(iface);
 	return ctx ? ctx->tx_eagain_retries : 0;
+}
+
+uint32_t csp_can_socketcan_tx_deadline_giveup_count(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->tx_deadline_giveups : 0;
 }
 
 uint32_t csp_can_socketcan_bus_off_count(const csp_iface_t * iface) {
@@ -295,7 +301,14 @@ static void * socketcan_rx_thread(void * arg) {
 }
 
 static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t *packet) {
-	(void)packet;
+	/* Per-PACKET deadline, stamped by the sender in packet->timestamp_tx as a
+	 * csp_get_ms() value (0 = none). It is checked before every back-off
+	 * sleep, so a sender blocked by a saturated bus waits until its deadline
+	 * and no longer: the per-frame CSP_CAN_SOCKETCAN_TX_BUDGET_MS below, which
+	 * restarts on every frame, let a 128-frame packet hold a rate group for
+	 * seconds. The CFP1 layer passes the packet on every frame; CFP2 only on
+	 * the last one, so CFP2 keeps the per-frame budget for all but that frame. */
+	const uint32_t deadline_ms = (packet != NULL) ? packet->timestamp_tx : 0;
 	if (dlc > CAN_MAX_DLEN) {
 		return CSP_ERR_INVAL;
 	}
@@ -328,7 +341,13 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 			case CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP:
 				/* The socket is non-blocking: ENOBUFS is the qdisc full,
 				 * EAGAIN the socket send buffer full. Either way the
-				 * controller is behind the offered load; wait for it. */
+				 * controller is behind the offered load; wait for it --
+				 * unless the packet's deadline has passed, then drop it now. */
+				if ((deadline_ms != 0) && ((int32_t)(csp_get_ms() - deadline_ms) >= 0)) {
+					ctx->tx_deadline_giveups++;
+					socketcan_log_giveup(ctx, errnum, waiting_ms);
+					return CSP_ERR_TX;
+				}
 				if (errnum == ENOBUFS) {
 					ctx->tx_enobufs_retries++;
 				} else {

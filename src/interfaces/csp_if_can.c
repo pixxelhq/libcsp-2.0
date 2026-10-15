@@ -434,9 +434,11 @@ static int csp_can1_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 
 	const csp_can_driver_tx_t tx_func = ifdata->tx_func;
 
-	/* Send first frame */
-	if ((tx_func)(iface->driver_data, can_id, frame_buf, CFP1_DATA_OFFSET + data_bytes, NULL) != CSP_ERR_NONE) {
-		iface->tx_error++;
+	/* Send first frame. The packet is handed to the driver on EVERY frame so
+	 * it can honour the per-packet deadline in packet->timestamp_tx (0 = none,
+	 * see can_socketcan.c). Transmit failures are counted once, in
+	 * csp_send_direct_iface()'s tx_err path, not here as well. */
+	if ((tx_func)(iface->driver_data, can_id, frame_buf, CFP1_DATA_OFFSET + data_bytes, packet) != CSP_ERR_NONE) {
 		/* Does not free on return */
 		return CSP_ERR_DRIVER;
 	}
@@ -463,8 +465,7 @@ static int csp_can1_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 		tx_count += data_bytes;
 
 		/* Send frame */
-		if ((tx_func)(iface->driver_data, can_id, packet->data + tx_count - data_bytes, data_bytes, NULL) != CSP_ERR_NONE) {
-			iface->tx_error++;
+		if ((tx_func)(iface->driver_data, can_id, packet->data + tx_count - data_bytes, data_bytes, packet) != CSP_ERR_NONE) {
 			/* Does not free on return */
 			return CSP_ERR_DRIVER;
 		}
@@ -785,9 +786,8 @@ static int csp_can2_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 		ctx_packet = packet;
 	}
 
-	/* Send first frame now */
+	/* Send first frame now. Failures are counted once, by csp_send_direct_iface(). */
 	if ((ifdata->tx_func)(iface->driver_data, can_id, frame_buf, frame_buf_inp, ctx_packet) != CSP_ERR_NONE) {
-		iface->tx_error++;
 		/* Does not free on return */
 		return CSP_ERR_DRIVER;
 	}
@@ -815,7 +815,6 @@ static int csp_can2_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 		}
 
 		if ((ifdata->tx_func)(iface->driver_data, can_id, packet->data + tx_count, data_bytes, ctx_packet) != CSP_ERR_NONE) {
-			iface->tx_error++;
 			/* Does not free on return */
 			return CSP_ERR_DRIVER;
 		}
