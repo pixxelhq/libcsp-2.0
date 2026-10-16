@@ -601,11 +601,17 @@ START_TEST(test_socketcan_counters_zero_for_foreign_iface)
 	ck_assert_uint_eq(csp_can_socketcan_tx_eagain_count(&rx_iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_bus_off_count(&rx_iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_tx_passive_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_deadline_giveup_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_queue_full_count(&rx_iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_queue_depth_max(&rx_iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_tx_enobufs_count(NULL), 0);
 	ck_assert_uint_eq(csp_can_socketcan_rx_overrun_count(NULL), 0);
 	ck_assert_uint_eq(csp_can_socketcan_tx_eagain_count(NULL), 0);
 	ck_assert_uint_eq(csp_can_socketcan_bus_off_count(NULL), 0);
 	ck_assert_uint_eq(csp_can_socketcan_tx_passive_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_deadline_giveup_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_queue_full_count(NULL), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_queue_depth_max(NULL), 0);
 }
 END_TEST
 
@@ -636,6 +642,8 @@ START_TEST(test_socketcan_counters_zero_for_kiss_like_context)
 	ck_assert_uint_eq(csp_can_socketcan_tx_eagain_count(&fake.iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_bus_off_count(&fake.iface), 0);
 	ck_assert_uint_eq(csp_can_socketcan_tx_passive_count(&fake.iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_queue_full_count(&fake.iface), 0);
+	ck_assert_uint_eq(csp_can_socketcan_tx_queue_depth_max(&fake.iface), 0);
 }
 END_TEST
 

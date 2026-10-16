@@ -1,5 +1,8 @@
 
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* pthread_setname_np */
+#endif
 #include <csp/drivers/can_socketcan.h>
 
 #include <stdio.h>
@@ -24,10 +27,20 @@
 #include <csp/arch/csp_time.h>
 #include <sched.h>
 #include <time.h>
+#include <poll.h>
+#include <stdatomic.h>
+#include <csp/arch/csp_queue.h>
 
 /* A give-up is logged at most this often per interface. A starved sender
  * abandons packets in bursts, and one line per packet flooded the FSW logger. */
 #define GIVEUP_LOG_INTERVAL_MS 1000
+
+/* One queued transmission: the packet (owned by the queue until the TX thread
+ * has sent or dropped it) and the next-hop the interface layer resolved. */
+typedef struct {
+	csp_packet_t * packet;
+	uint16_t via;
+} socketcan_tx_item_t;
 
 // CAN interface data, state, etc.
 typedef struct {
@@ -35,10 +48,18 @@ typedef struct {
 	csp_iface_t iface;
 	csp_can_interface_data_t ifdata;
 	pthread_t rx_thread;
+	pthread_t tx_thread;
+	bool tx_thread_started;
+	atomic_bool tx_stop;         /**< asks the TX thread to return; it is joined, never cancelled, so no queue mutex is left locked */
+	csp_queue_handle_t txq;      /**< transmit queue of socketcan_tx_item_t, see CSP_CAN_SOCKETCAN_TX_QUEUE_LEN */
+	csp_static_queue_t txq_static;
+	char txq_buf[CSP_CAN_SOCKETCAN_TX_QUEUE_LEN * sizeof(socketcan_tx_item_t)];
 	int socket;
 	uint32_t tx_enobufs_retries; /**< write() backoffs on ENOBUFS, see csp_can_socketcan_tx_enobufs_count() */
 	uint32_t tx_eagain_retries;  /**< write() backoffs on EAGAIN, see csp_can_socketcan_tx_eagain_count() */
 	uint32_t tx_deadline_giveups; /**< packets abandoned because their timestamp_tx deadline passed, see csp_can_socketcan_tx_deadline_giveup_count() */
+	uint32_t tx_queue_full_drops; /**< packets refused because the transmit queue was full, see csp_can_socketcan_tx_queue_full_count() */
+	uint32_t tx_queue_depth_max;  /**< deepest the transmit queue has been, see csp_can_socketcan_tx_queue_depth_max() */
 	uint32_t rx_overrun_count;   /**< CAN_ERR_CRTL_RX_OVERFLOW error frames, see csp_can_socketcan_rx_overrun_count() */
 	uint32_t bus_off_count;      /**< CAN_ERR_BUSOFF error frames, see csp_can_socketcan_bus_off_count() */
 	uint32_t tx_passive_count;   /**< CAN_ERR_CRTL_TX_PASSIVE error frames, see csp_can_socketcan_tx_passive_count() */
@@ -58,6 +79,17 @@ void csp_can_socketcan_set_rx_priority(int priority) {
 
 int csp_can_socketcan_rx_priority(void) {
 	return rx_thread_priority;
+}
+
+/* SCHED_FIFO priority for TX threads created from now on; -1 = follow RX */
+static int tx_thread_priority = -1;
+
+void csp_can_socketcan_set_tx_priority(int priority) {
+	tx_thread_priority = (priority < -1) ? -1 : priority;
+}
+
+int csp_can_socketcan_tx_priority(void) {
+	return (tx_thread_priority < 0) ? rx_thread_priority : tx_thread_priority;
 }
 
 uint32_t csp_can_socketcan_latency_us(const struct timespec * rx, const struct timespec * now) {
@@ -109,6 +141,16 @@ uint32_t csp_can_socketcan_tx_eagain_count(const csp_iface_t * iface) {
 uint32_t csp_can_socketcan_tx_deadline_giveup_count(const csp_iface_t * iface) {
 	const can_context_t * ctx = socketcan_ctx(iface);
 	return ctx ? ctx->tx_deadline_giveups : 0;
+}
+
+uint32_t csp_can_socketcan_tx_queue_full_count(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->tx_queue_full_drops : 0;
+}
+
+uint32_t csp_can_socketcan_tx_queue_depth_max(const csp_iface_t * iface) {
+	const can_context_t * ctx = socketcan_ctx(iface);
+	return ctx ? ctx->tx_queue_depth_max : 0;
 }
 
 uint32_t csp_can_socketcan_bus_off_count(const csp_iface_t * iface) {
@@ -175,6 +217,14 @@ static void socketcan_log_giveup(can_context_t * ctx, int errnum, uint32_t waite
 static void socketcan_free(can_context_t * ctx) {
 
 	if (ctx) {
+		if (ctx->txq != NULL) {
+			/* Only reached once the TX thread is gone (or was never started). */
+			socketcan_tx_item_t item;
+			while (csp_queue_dequeue(ctx->txq, &item, 0) == CSP_QUEUE_OK) {
+				csp_buffer_free(item.packet);
+			}
+			csp_queue_free(ctx->txq);
+		}
 		if (ctx->socket >= 0) {
 			close(ctx->socket);
 		}
@@ -300,14 +350,20 @@ static void * socketcan_rx_thread(void * arg) {
 	pthread_exit(NULL);
 }
 
+/* Runs on the interface's TX thread only (socketcan_tx_thread), never on a
+ * sender's thread, so waiting here costs nobody a rate-group tick.
+ *
+ * Per-PACKET deadline, stamped by the sender in packet->timestamp_tx as a
+ * csp_get_ms() value (0 = none). Normally a stale packet is dropped whole
+ * before its first frame (socketcan_tx_thread); this check catches the
+ * deadline passing while the kernel refuses a frame mid-packet, and the
+ * per-frame CSP_CAN_SOCKETCAN_TX_BUDGET_MS is the final stop for a bus that
+ * never recovers. Both leave a partial packet on the wire that every peer
+ * times out after CSP_CAN_PBUF_TIMEOUT_MS: the price of not wedging on a dead
+ * bus, paid only when it is dead. The CFP1 layer passes the packet on every
+ * frame; CFP2 only on the last one, so CFP2 keeps the per-frame budget for
+ * all but that frame. */
 static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t *packet) {
-	/* Per-PACKET deadline, stamped by the sender in packet->timestamp_tx as a
-	 * csp_get_ms() value (0 = none). It is checked before every back-off
-	 * sleep, so a sender blocked by a saturated bus waits until its deadline
-	 * and no longer: the per-frame CSP_CAN_SOCKETCAN_TX_BUDGET_MS below, which
-	 * restarts on every frame, let a 128-frame packet hold a rate group for
-	 * seconds. The CFP1 layer passes the packet on every frame; CFP2 only on
-	 * the last one, so CFP2 keeps the per-frame budget for all but that frame. */
 	const uint32_t deadline_ms = (packet != NULL) ? packet->timestamp_tx : 0;
 	if (dlc > CAN_MAX_DLEN) {
 		return CSP_ERR_INVAL;
@@ -349,11 +405,16 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 					return CSP_ERR_TX;
 				}
 				if (errnum == ENOBUFS) {
+					/* qdisc (txqueuelen) full: POLLOUT does not report it, so sleep. */
 					ctx->tx_enobufs_retries++;
+					usleep(CSP_CAN_SOCKETCAN_TX_BACKOFF_MS * 1000);
 				} else {
+					/* Socket send buffer full: wake as soon as the kernel drains
+					 * some of it, at most one back-off step. */
 					ctx->tx_eagain_retries++;
+					struct pollfd pfd = {.fd = ctx->socket, .events = POLLOUT};
+					(void)poll(&pfd, 1, CSP_CAN_SOCKETCAN_TX_BACKOFF_MS);
 				}
-				usleep(CSP_CAN_SOCKETCAN_TX_BACKOFF_MS * 1000);
 				break;
 			case CSP_CAN_SOCKETCAN_TX_GIVE_UP:
 				socketcan_log_giveup(ctx, errnum, waiting_ms);
@@ -366,6 +427,96 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 	}
 
 	return CSP_ERR_NONE;
+}
+
+/* The interface's tx_enqueue hook: called on the sender's thread, never
+ * blocks, never touches the socket. Ownership of the packet passes to the
+ * queue on success; on a full queue it stays with the caller, which frees it
+ * and counts tx_error (csp_send_direct_iface()). */
+static int socketcan_tx_enqueue(void * driver_data, csp_packet_t * packet, uint16_t via) {
+	can_context_t * ctx = driver_data;
+	const socketcan_tx_item_t item = {.packet = packet, .via = via};
+
+	if (csp_queue_enqueue(ctx->txq, &item, 0) != CSP_QUEUE_OK) {
+		ctx->tx_queue_full_drops++;
+		return CSP_ERR_TX;
+	}
+	const int depth = csp_queue_size(ctx->txq);
+	if ((depth > 0) && ((uint32_t)depth > ctx->tx_queue_depth_max)) {
+		ctx->tx_queue_depth_max = (uint32_t)depth;
+	}
+	return CSP_ERR_NONE;
+}
+
+/* One writer per interface: a packet's frames leave contiguously, and every
+ * wait for the kernel happens here. A packet whose deadline already passed
+ * while it queued is dropped whole, so a saturated bus costs stale packets,
+ * not partial ones. */
+static void * socketcan_tx_thread(void * arg) {
+	can_context_t * ctx = arg;
+	socketcan_tx_item_t item;
+
+	while (!atomic_load(&ctx->tx_stop)) {
+		/* Bounded wait so a stop request is seen within one period. */
+		if (csp_queue_dequeue(ctx->txq, &item, 100) != CSP_QUEUE_OK) {
+			continue;
+		}
+		csp_packet_t * packet = item.packet;
+		const uint32_t deadline_ms = packet->timestamp_tx;
+		if ((deadline_ms != 0) && ((int32_t)(csp_get_ms() - deadline_ms) >= 0)) {
+			ctx->tx_deadline_giveups++;
+			ctx->iface.tx_error++;
+			csp_buffer_free(packet);
+			continue;
+		}
+		if (csp_can_tx_packet_sync(&ctx->iface, item.via, packet) != CSP_ERR_NONE) {
+			/* The sync path does not free on failure; the frame-level
+			 * reason (deadline, budget, hard error) was already counted. */
+			ctx->iface.tx_error++;
+			csp_buffer_free(packet);
+		}
+	}
+	return NULL;
+}
+
+/* Create a driver thread, SCHED_FIFO at @p priority when > 0 (clamped to the
+ * policy's range); a refusal -- typically EPERM without CAP_SYS_NICE -- falls
+ * back to default attributes rather than failing the interface. Returns 0 or
+ * the pthread_create() error. */
+static int socketcan_start_thread(can_context_t * ctx, pthread_t * thread, void * (*fn)(void *), int priority, const char * what) {
+	int created = -1;
+	if (priority > 0) {
+		pthread_attr_t attr;
+		struct sched_param sp;
+		const int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
+		int prio = priority;
+		if ((lo >= 0) && (prio < lo)) prio = lo;
+		if ((hi >= 0) && (prio > hi)) prio = hi;
+		memset(&sp, 0, sizeof(sp));
+		sp.sched_priority = prio;
+		if ((pthread_attr_init(&attr) == 0) &&
+			(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0) &&
+			(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0) &&
+			(pthread_attr_setschedparam(&attr, &sp) == 0)) {
+			created = pthread_create(thread, &attr, fn, ctx);
+			if (created == 0) {
+				csp_print("%s[%s]: %s thread SCHED_FIFO priority %d\n", __func__, ctx->name, what, prio);
+			} else {
+				csp_print("%s[%s]: SCHED_FIFO %d refused for the %s thread (%s), using default scheduling\n", __func__, ctx->name, prio, what, strerror(created));
+			}
+		}
+		pthread_attr_destroy(&attr);
+	}
+	if (created != 0) {
+		created = pthread_create(thread, NULL, fn, ctx);
+	}
+	if (created == 0) {
+		/* Visible in ps -T / top -H; 15 chars max. */
+		char tname[16];
+		snprintf(tname, sizeof(tname), "%s-%.*s", what, (int)(sizeof(tname) - 1 - strlen(what) - 1), ctx->name);
+		(void)pthread_setname_np(*thread, tname);
+	}
+	return created;
 }
 
 
@@ -488,8 +639,17 @@ int csp_can_socketcan_open_and_add_interface(const char * device, const char * i
 	ctx->iface.interface_data = &ctx->ifdata;
 	ctx->iface.driver_data = ctx;
 	ctx->ifdata.tx_func = csp_can_tx_frame;
+	ctx->ifdata.tx_enqueue = socketcan_tx_enqueue;
 	ctx->iface.add_alias = csp_can_socketcan_add_alias;
 	ctx->ifdata.pbufs = NULL;
+	atomic_init(&ctx->tx_stop, false);
+
+	ctx->txq = csp_queue_create_static(CSP_CAN_SOCKETCAN_TX_QUEUE_LEN, sizeof(socketcan_tx_item_t), ctx->txq_buf, &ctx->txq_static);
+	if (ctx->txq == NULL) {
+		csp_print("%s[%s]: transmit queue allocation failed\n", __func__, ctx->name);
+		socketcan_free(ctx);
+		return CSP_ERR_NOMEM;
+	}
 
 	/* Create socket */
 	if ((ctx->socket = socket(PF_CAN, SOCK_RAW, CAN_RAW)) < 0) {
@@ -596,42 +756,26 @@ int csp_can_socketcan_open_and_add_interface(const char * device, const char * i
 		return res;
 	}
 
-	/* Create receive thread. SCHED_FIFO when asked for (see
-	 * csp_can_socketcan_set_rx_priority); a refusal -- typically EPERM
-	 * without CAP_SYS_NICE -- falls back to default attributes rather than
-	 * failing the interface. */
-	int created = -1;
-	if (rx_thread_priority > 0) {
-		pthread_attr_t attr;
-		struct sched_param sp;
-		const int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
-		int prio = rx_thread_priority;
-		if ((lo >= 0) && (prio < lo)) prio = lo;
-		if ((hi >= 0) && (prio > hi)) prio = hi;
-		memset(&sp, 0, sizeof(sp));
-		sp.sched_priority = prio;
-		if ((pthread_attr_init(&attr) == 0) &&
-			(pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0) &&
-			(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0) &&
-			(pthread_attr_setschedparam(&attr, &sp) == 0)) {
-			created = pthread_create(&ctx->rx_thread, &attr, socketcan_rx_thread, ctx);
-			if (created == 0) {
-				csp_print("%s[%s]: RX thread SCHED_FIFO priority %d\n", __func__, ctx->name, prio);
-			} else {
-				csp_print("%s[%s]: SCHED_FIFO %d refused for the RX thread (%s), using default scheduling\n", __func__, ctx->name, prio, strerror(created));
-			}
-		}
-		pthread_attr_destroy(&attr);
-	}
+	/* Receive thread, then the transmit thread that drains ctx->txq. Both
+	 * SCHED_FIFO when asked for (csp_can_socketcan_set_rx_priority /
+	 * _set_tx_priority), with a fallback to default attributes. */
+	int created = socketcan_start_thread(ctx, &ctx->rx_thread, socketcan_rx_thread, rx_thread_priority, "canrx");
 	if (created != 0) {
-		created = pthread_create(&ctx->rx_thread, NULL, socketcan_rx_thread, ctx);
-	}
-	if (created != 0) {
-		csp_print("%s[%s]: pthread_create() failed, error: %s\n", __func__, ctx->name, strerror(created));
+		csp_print("%s[%s]: pthread_create() failed for the RX thread, error: %s\n", __func__, ctx->name, strerror(created));
 		(void)csp_can_remove_interface(&ctx->iface);
 		socketcan_free(ctx);
 		return CSP_ERR_NOMEM;
 	}
+	created = socketcan_start_thread(ctx, &ctx->tx_thread, socketcan_tx_thread, csp_can_socketcan_tx_priority(), "cantx");
+	if (created != 0) {
+		csp_print("%s[%s]: pthread_create() failed for the TX thread, error: %s\n", __func__, ctx->name, strerror(created));
+		(void)csp_can_remove_interface(&ctx->iface);
+		(void)pthread_cancel(ctx->rx_thread);
+		(void)pthread_join(ctx->rx_thread, NULL);
+		socketcan_free(ctx);
+		return CSP_ERR_NOMEM;
+	}
+	ctx->tx_thread_started = true;
 
 	if (return_iface) {
 		*return_iface = &ctx->iface;
@@ -648,6 +792,20 @@ csp_iface_t * csp_can_socketcan_init(const char * device, unsigned int node_id, 
 
 int csp_can_socketcan_stop(csp_iface_t * iface) {
 	can_context_t * ctx = iface->driver_data;
+
+	/* The TX thread is asked to stop and joined (not cancelled: a cancel
+	 * inside the queue's condition wait would leave its mutex locked). It
+	 * finishes the packet in hand first; whatever is still queued is freed by
+	 * socketcan_free(). */
+	if (ctx->tx_thread_started) {
+		atomic_store(&ctx->tx_stop, true);
+		int terr = pthread_join(ctx->tx_thread, NULL);
+		if (terr != 0) {
+			csp_print("%s[%s]: pthread_join() failed for the TX thread, error: %s\n", __func__, ctx->name, strerror(terr));
+			return CSP_ERR_DRIVER;
+		}
+		ctx->tx_thread_started = false;
+	}
 
 	int error = pthread_cancel(ctx->rx_thread);
 	if (error != 0) {

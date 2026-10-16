@@ -81,11 +81,20 @@ int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t net
 /** Sleep between two attempts to write a frame the kernel would not take. */
 #define CSP_CAN_SOCKETCAN_TX_BACKOFF_MS 5
 /** Total back-off a single frame may spend before the packet is abandoned.
- *  Fallback only: a packet whose csp_packet_t::timestamp_tx holds a
- *  csp_get_ms() deadline is abandoned as soon as that deadline passes, whatever
- *  frame it is on. Stamp it before csp_send_direct_iface() to bound how long a
- *  send may block the calling thread (CFP1 checks it on every frame). */
+ *  The dead-bus stop: the TX thread (see CSP_CAN_SOCKETCAN_TX_QUEUE_LEN) gives
+ *  up on a packet after this much back-off on one frame, so a bus that never
+ *  takes a frame again (bus-off, cable out) cannot wedge the thread. A packet
+ *  whose csp_packet_t::timestamp_tx holds a csp_get_ms() deadline is dropped
+ *  earlier: whole, when it is dequeued after the deadline, or mid-packet if the
+ *  deadline passes while the kernel refuses a frame. */
 #define CSP_CAN_SOCKETCAN_TX_BUDGET_MS 1000
+/** Packets a transmit queue holds. Each socketcan interface has one, drained
+ *  by its own TX thread, so a sender never writes to the socket itself: it
+ *  pushes the packet (a pointer, no copy) and returns at once. A full queue
+ *  refuses the packet whole (csp_can_socketcan_tx_queue_full_count()), so
+ *  back-pressure never leaves a partial packet on the wire. Latency in the
+ *  queue is bounded by the packets' own deadlines, not by this length. */
+#define CSP_CAN_SOCKETCAN_TX_QUEUE_LEN 64
 /** SO_SNDBUF requested at open. The kernel clamps it to net.core.wmem_max. */
 #define CSP_CAN_SOCKETCAN_SNDBUF_BYTES (4 * 1024 * 1024)
 /** SO_RCVBUF requested at open. The kernel clamps it to net.core.rmem_max. */
@@ -143,6 +152,22 @@ uint32_t csp_can_socketcan_tx_eagain_count(const csp_iface_t * iface);
 uint32_t csp_can_socketcan_tx_deadline_giveup_count(const csp_iface_t * iface);
 
 /**
+ * Packets refused at enqueue because the interface's transmit queue was full
+ * (CSP_CAN_SOCKETCAN_TX_QUEUE_LEN). Refused whole: nothing of them reached the
+ * wire. Each one is also counted under csp_iface_t::tx_error by the caller.
+ * @return count, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_tx_queue_full_count(const csp_iface_t * iface);
+
+/**
+ * Deepest the transmit queue has been, in packets, sampled after each enqueue.
+ * Near CSP_CAN_SOCKETCAN_TX_QUEUE_LEN means the bus cannot carry the offered
+ * load and queue-full drops are close.
+ * @return packets, 0 for NULL or a non-socketcan interface.
+ */
+uint32_t csp_can_socketcan_tx_queue_depth_max(const csp_iface_t * iface);
+
+/**
  * CAN_ERR_BUSOFF error frames: the controller left the bus. With a restart
  * delay configured it comes back on its own, but every frame queued meanwhile
  * was lost and every peer's reassembly of them is stranded.
@@ -176,6 +201,19 @@ void csp_can_socketcan_set_rx_priority(int priority);
 
 /** @return the value last given to csp_can_socketcan_set_rx_priority(), 0 by default */
 int csp_can_socketcan_rx_priority(void);
+
+/**
+ * Scheduling for the transmit thread of every interface opened AFTER this call,
+ * with the same rules as csp_can_socketcan_set_rx_priority(). The default (-1)
+ * follows the RX priority, which is what a node wants: the drain must outrank
+ * the rate groups that fill the queue, and blocking in it costs nobody else.
+ *
+ * @param[in] priority SCHED_FIFO priority, 0 = default scheduling, -1 = same as RX
+ */
+void csp_can_socketcan_set_tx_priority(int priority);
+
+/** @return the effective TX thread priority for interfaces opened now (0 = default scheduling) */
+int csp_can_socketcan_tx_priority(void);
 
 /**
  * Socket-to-read latency: kernel receive timestamp (SO_TIMESTAMPNS) to the

@@ -378,6 +378,18 @@ static int csp_can1_rx(csp_iface_t * iface, uint32_t id, const uint8_t * data, u
 #endif /* CSP_CFP_OUT_OF_ORDER_RX */
 }
 
+/* Hand the packet to the driver's TX thread when it has one, else transmit
+ * it here. The sync path and the hook share the ownership rule: the packet is
+ * consumed on success and left to the caller (csp_send_direct_iface(), which
+ * frees it and counts tx_error) on failure. */
+static int csp_can_tx_dispatch(csp_iface_t * iface, uint16_t via, csp_packet_t * packet) {
+	csp_can_interface_data_t * ifdata = iface->interface_data;
+	if (ifdata->tx_enqueue != NULL) {
+		return ifdata->tx_enqueue(iface->driver_data, packet, via);
+	}
+	return csp_can_tx_packet_sync(iface, via, packet);
+}
+
 static int csp_can1_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet, int from_me) {
 	(void)from_me; /* Avoid compiler warnings about unused parameter */
 
@@ -386,6 +398,11 @@ static int csp_can1_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 		csp_qfifo_write(packet, iface, NULL);
 		return CSP_ERR_NONE;
 	}
+
+	return csp_can_tx_dispatch(iface, via, packet);
+}
+
+static int csp_can1_tx_sync(csp_iface_t * iface, uint16_t via, csp_packet_t * packet) {
 
 	csp_can_interface_data_t * ifdata = iface->interface_data;
 
@@ -732,15 +749,19 @@ static int csp_can2_rx(csp_iface_t * iface, uint32_t id, const uint8_t * data, u
 }
 
 static int csp_can2_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet, int from_me) {
-	/* Avoid compiler warnings about unused parameter */
-	(void)via;
-	(void)from_me;
+	(void)from_me; /* Avoid compiler warnings about unused parameter */
 
 	/* Loopback */
 	if (packet->id.dst == iface->addr || csp_addr_is_alias(packet->id.dst)) {
 		csp_qfifo_write(packet, iface, NULL);
 		return CSP_ERR_NONE;
 	}
+
+	return csp_can_tx_dispatch(iface, via, packet);
+}
+
+static int csp_can2_tx_sync(csp_iface_t * iface, uint16_t via, csp_packet_t * packet) {
+	(void)via; /* CFP2 addresses by packet->id.dst only */
 
 	csp_can_interface_data_t * ifdata = iface->interface_data;
 
@@ -826,6 +847,17 @@ static int csp_can2_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet,
 	csp_buffer_free(packet);
 
 	return CSP_ERR_NONE;
+}
+
+int csp_can_tx_packet_sync(csp_iface_t * iface, uint16_t via, csp_packet_t * packet) {
+
+	if ((iface == NULL) || (packet == NULL)) {
+		return CSP_ERR_INVAL;
+	}
+	if (csp_conf.version == 1) {
+		return csp_can1_tx_sync(iface, via, packet);
+	}
+	return csp_can2_tx_sync(iface, via, packet);
 }
 
 int csp_can_is_can_interface(const csp_iface_t * iface) {

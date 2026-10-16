@@ -194,10 +194,28 @@ extern "C" {
  * @param[in] id CAM message id.
  * @param[in] data CAN data
  * @param[in] dlc data length of \a data.
- * @param[in] packet the CSP packet where data is from. Is only valid for END frames else NULL.
+ * @param[in] packet the CSP packet where data is from. CFP1 passes it on every
+ *            frame (so a driver can honour the packet's csp_packet_t::timestamp_tx
+ *            deadline); CFP2 passes it on END frames only, NULL otherwise.
  * @return #CSP_ERR_NONE on success, otherwise an error code.
  */
 typedef int (*csp_can_driver_tx_t)(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t * packet);
+
+/**
+ * Optional driver hook: queue a whole packet for transmission by a driver-owned
+ * thread instead of fragmenting and writing it on the caller's thread.
+ *
+ * On success the driver takes ownership of @p packet and must eventually
+ * transmit it with csp_can_tx_packet_sync() (which frees it) or free it. On
+ * failure (queue full) the driver returns #CSP_ERR_TX and does NOT free: the
+ * caller (csp_send_direct_iface()) frees the packet and counts the failure.
+ * Must never block.
+ *
+ * @param[in] driver_data driver data from #csp_iface_t
+ * @param[in] packet packet to transmit, header already prepended-ready
+ * @param[in] via next-hop address, #CSP_NO_VIA_ADDRESS to use the packet's dst
+ */
+typedef int (*csp_can_driver_tx_enqueue_t)(void * driver_data, csp_packet_t * packet, uint16_t via);
 
 #ifndef CSP_CAN_EARLY_FRAGMENTS
 #define CSP_CAN_EARLY_FRAGMENTS 0
@@ -231,6 +249,7 @@ typedef struct {
 	atomic_int cfp_packet_counter; /**< CFP Identification number - same number on all fragments from same CSP packet. */
 #endif
 	csp_can_driver_tx_t tx_func; /**< Tx function */
+	csp_can_driver_tx_enqueue_t tx_enqueue; /**< Optional: hand whole packets to a driver TX thread; NULL = transmit synchronously on the caller's thread */
 	csp_packet_t * pbufs; /**< PBUF queue */
 	uint32_t rx_timeouts; /**< Partial packets discarded by the reassembly timeout, see csp_can_rx_timeout_count() */
 	uint32_t early_rescued; /**< Packets completed with fragments that arrived before their BEGIN, see csp_can_rx_reorder_rescued_count() */
@@ -248,6 +267,19 @@ typedef struct {
  * @return #CSP_ERR_NONE on success, otherwise an error code.
 */
 int csp_can_add_interface(csp_iface_t * iface);
+
+/**
+ * Fragment and transmit one packet on the calling thread, through the
+ * interface's tx_func, frame by frame (CFP1 or CFP2 by csp_conf.version).
+ * This is the body of the interface's nexthop; a driver that implements
+ * tx_enqueue calls it from its TX thread.
+ *
+ * @param[in] iface CAN interface
+ * @param[in] via next-hop address, #CSP_NO_VIA_ADDRESS to use the packet's dst
+ * @param[in] packet packet to send. Freed on success; NOT freed on failure.
+ * @return #CSP_ERR_NONE, or #CSP_ERR_DRIVER when the driver refused a frame.
+ */
+int csp_can_tx_packet_sync(csp_iface_t * iface, uint16_t via, csp_packet_t * packet);
 
 /**
  * Remove interface.
