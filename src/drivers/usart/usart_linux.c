@@ -1,7 +1,12 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE /* pthread_setname_np */
+#endif
 #include <csp/drivers/usart.h>
 
 #include <csp/csp_debug.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <sched.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -53,6 +58,61 @@ static void * usart_rx_thread(void * arg) {
 		ctx->rx_callback(ctx->user_data, cbuf, length, NULL);
 	}
 	return NULL;
+}
+
+/* KISS TX thread, SCHED_FIFO at @p priority when > 0 (clamped to the policy's
+ * range); a refusal -- typically EPERM without CAP_SYS_NICE -- falls back to
+ * default attributes rather than failing the interface. Detached, like the
+ * RX thread: there is no stop path. */
+int csp_usart_tx_thread_create(void * (*fn)(void *), void * arg, const char * name, int priority) {
+	pthread_t thread;
+	pthread_attr_t attr;
+	int created = -1;
+
+	if ((fn == NULL) || (pthread_attr_init(&attr) != 0)) {
+		return CSP_ERR_INVAL;
+	}
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+	if (priority > 0) {
+		struct sched_param sp;
+		const int lo = sched_get_priority_min(SCHED_FIFO), hi = sched_get_priority_max(SCHED_FIFO);
+		int prio = priority;
+		if ((lo >= 0) && (prio < lo)) prio = lo;
+		if ((hi >= 0) && (prio > hi)) prio = hi;
+		memset(&sp, 0, sizeof(sp));
+		sp.sched_priority = prio;
+		if ((pthread_attr_setschedpolicy(&attr, SCHED_FIFO) == 0) &&
+			(pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED) == 0) &&
+			(pthread_attr_setschedparam(&attr, &sp) == 0)) {
+			created = pthread_create(&thread, &attr, fn, arg);
+			if (created == 0) {
+				csp_print("%s[%s]: TX thread SCHED_FIFO priority %d\n", __func__, name ? name : "?", prio);
+			} else {
+				csp_print("%s[%s]: SCHED_FIFO %d refused for the TX thread (%s), using default scheduling\n", __func__, name ? name : "?", prio, strerror(created));
+			}
+		}
+	}
+	if (created != 0) {
+		pthread_attr_t plain;
+		if (pthread_attr_init(&plain) == 0) {
+			pthread_attr_setdetachstate(&plain, PTHREAD_CREATE_DETACHED);
+			created = pthread_create(&thread, &plain, fn, arg);
+			pthread_attr_destroy(&plain);
+		}
+	}
+	pthread_attr_destroy(&attr);
+	if (created != 0) {
+		csp_print("%s[%s]: pthread_create() failed: %s\n", __func__, name ? name : "?", strerror(created));
+		return CSP_ERR_DRIVER;
+	}
+	if (name != NULL) {
+		/* Visible in ps -T / top -H; 15 chars max. */
+		char tname[16];
+		snprintf(tname, sizeof(tname), "kisstx-%.8s", name);
+		(void)pthread_setname_np(thread, tname);
+	}
+	return CSP_ERR_NONE;
 }
 
 int csp_usart_write(csp_usart_fd_t fd, const void * data, size_t data_length) {

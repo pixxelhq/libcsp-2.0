@@ -22,10 +22,26 @@
 #define TFESC    0xDD
 #define TNC_DATA 0x00
 
+/* Hand the packet to the driver's TX thread when it has one, else transmit
+ * it here. Both share the ownership rule: consumed on success, left to the
+ * caller (csp_send_direct_iface(), which frees it and counts tx_error) on
+ * failure. */
 int csp_kiss_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet, int from_me) {
 	/* Avoid compiler warnings about unused parameter */
 	(void)via;
 	(void)from_me;
+
+	csp_kiss_interface_data_t * ifdata = iface->interface_data;
+	if (ifdata->tx_enqueue != NULL) {
+		return ifdata->tx_enqueue(iface->driver_data, packet);
+	}
+	return csp_kiss_tx_packet_sync(iface, packet);
+}
+
+/* Worst case every byte of the frame is escaped, plus FEND, TNC_DATA, FEND. */
+#define KISS_TX_BUF_SIZE (2 * (CSP_PACKET_PADDING_BYTES + CSP_BUFFER_SIZE) + 3)
+
+int csp_kiss_tx_packet_sync(csp_iface_t * iface, csp_packet_t * packet) {
 
 	csp_kiss_interface_data_t * ifdata = iface->interface_data;
 	void * driver = iface->driver_data;
@@ -41,30 +57,44 @@ int csp_kiss_tx(csp_iface_t * iface, uint16_t via, csp_packet_t * packet, int fr
 	/* Save the outgoing id in the buffer */
 	csp_id_prepend(packet);
 
-	/* Transmit data */
-	const unsigned char start[] = {FEND, TNC_DATA};
-	const unsigned char esc_end[] = {FESC, TFEND};
-	const unsigned char esc_esc[] = {FESC, TFESC};
-	const unsigned char * data = packet->frame_begin;
+	/* Encode the whole frame once, so the driver sees one write per packet
+	 * instead of one per byte (~1,100 syscalls for a full packet at the old
+	 * byte-at-a-time rate). */
+	uint8_t buf[KISS_TX_BUF_SIZE];
+	size_t n = 0;
+	const uint8_t * data = packet->frame_begin;
 
-	ifdata->tx_func(driver, start, sizeof(start));
+	if (packet->frame_length > (CSP_PACKET_PADDING_BYTES + CSP_BUFFER_SIZE)) {
+		csp_usart_unlock(driver);
+		return CSP_ERR_INVAL;
+	}
 
+	buf[n++] = FEND;
+	buf[n++] = TNC_DATA;
 	for (unsigned int i = 0; i < packet->frame_length; i++, ++data) {
 		if (*data == FEND) {
-			ifdata->tx_func(driver, esc_end, sizeof(esc_end));
+			buf[n++] = FESC;
+			buf[n++] = TFEND;
 			continue;
 		}
 		if (*data == FESC) {
-			ifdata->tx_func(driver, esc_esc, sizeof(esc_esc));
+			buf[n++] = FESC;
+			buf[n++] = TFESC;
 			continue;
 		}
-		ifdata->tx_func(driver, data, 1);
+		buf[n++] = *data;
 	}
-	const unsigned char stop[] = {FEND};
-	ifdata->tx_func(driver, stop, sizeof(stop));
+	buf[n++] = FEND;
+
+	const int res = ifdata->tx_func(driver, buf, n);
 
 	/* Unlock */
 	csp_usart_unlock(driver);
+
+	if (res != CSP_ERR_NONE) {
+		/* Does not free on failure */
+		return res;
+	}
 
 	/* Free data */
 	csp_buffer_free(packet);

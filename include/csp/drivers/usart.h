@@ -101,6 +101,68 @@ void csp_usart_unlock(void * driver_data);
  */
 int csp_usart_open_and_add_kiss_interface(const csp_usart_conf_t * conf, const char * ifname, uint16_t addr, csp_iface_t ** return_iface);
 
+/** Packets a KISS interface's transmit queue holds. Each interface opened by
+ *  csp_usart_open_and_add_kiss_interface() has one, drained by its own TX
+ *  thread, so a sender never writes to the tty itself: it pushes the packet
+ *  (a pointer, no copy) and returns at once. A full queue refuses the packet
+ *  whole (csp_usart_kiss_tx_queue_full_count()). Same model and length as
+ *  CSP_CAN_SOCKETCAN_TX_QUEUE_LEN. */
+#define CSP_USART_KISS_TX_QUEUE_LEN 64
+
+/**
+ * Set the scheduling priority of KISS TX threads created from now on.
+ *
+ * > 0 asks for SCHED_FIFO at that priority on POSIX (clamped to the policy's
+ * range; a refusal falls back to default scheduling); 0 (the default) creates
+ * a plain thread. Call before csp_usart_open_and_add_kiss_interface().
+ *
+ * @param[in] priority SCHED_FIFO priority, or 0 for default scheduling.
+ */
+void csp_usart_kiss_set_tx_priority(int priority);
+
+/** @return the value last given to csp_usart_kiss_set_tx_priority(), 0 by default */
+int csp_usart_kiss_tx_priority(void);
+
+/**
+ * Packets refused because the interface's transmit queue was full. Nothing
+ * of them reached the wire; each is also counted in iface->tx_error.
+ * @return the count, or 0 when @p iface is not a KISS interface of this driver.
+ */
+uint32_t csp_usart_kiss_tx_queue_full_count(const csp_iface_t * iface);
+
+/**
+ * Deepest the transmit queue has been, in packets (headroom indicator;
+ * near CSP_USART_KISS_TX_QUEUE_LEN the next burst drops).
+ * @return the depth, or 0 when @p iface is not a KISS interface of this driver.
+ */
+uint32_t csp_usart_kiss_tx_queue_depth_max(const csp_iface_t * iface);
+
+/**
+ * Packets the TX thread dropped unsent because their csp_packet_t::timestamp_tx
+ * deadline (a csp_get_ms() value, 0 = none) had passed when they were
+ * dequeued. Always whole: once a frame is on the wire the packet is finished.
+ * Each is also counted in iface->tx_error.
+ * @return the count, or 0 when @p iface is not a KISS interface of this driver.
+ */
+uint32_t csp_usart_kiss_tx_deadline_giveup_count(const csp_iface_t * iface);
+
+/**
+ * Platform hook: start a detached thread running @p fn(@p arg) for a KISS
+ * interface's transmit queue. POSIX implements it (SCHED_FIFO when
+ * @p priority > 0); a platform without threads returns #CSP_ERR_NOTSUP and
+ * the interface then transmits synchronously on the caller's thread.
+ *
+ * .. note:: There is no stop path: like the RX thread, it lives as long as
+ *           the process.
+ *
+ * @param[in] fn thread body
+ * @param[in] arg passed to @p fn
+ * @param[in] name interface name, used for the thread name
+ * @param[in] priority SCHED_FIFO priority, or 0 for default scheduling
+ * @return #CSP_ERR_NONE on success, otherwise an error code.
+ */
+int csp_usart_tx_thread_create(void * (*fn)(void *), void * arg, const char * name, int priority);
+
 #ifdef __cplusplus
 }
 #endif

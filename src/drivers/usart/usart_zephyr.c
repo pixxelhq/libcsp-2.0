@@ -31,6 +31,15 @@ void csp_usart_unlock(void * driver_data) {
 	k_mutex_unlock(&uart_driver_lock);
 }
 
+/* No KISS TX thread on zephyr: the interface transmits synchronously. */
+int csp_usart_tx_thread_create(void * (*fn)(void *), void * arg, const char * name, int priority) {
+	(void)fn;
+	(void)arg;
+	(void)name;
+	(void)priority;
+	return CSP_ERR_NOTSUP;
+}
+
 int csp_usart_write(csp_usart_fd_t fd, const void * data, size_t data_length) {
 	unsigned char * buf = (unsigned char *)data;
 
