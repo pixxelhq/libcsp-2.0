@@ -353,18 +353,17 @@ static void * socketcan_rx_thread(void * arg) {
 /* Runs on the interface's TX thread only (socketcan_tx_thread), never on a
  * sender's thread, so waiting here costs nobody a rate-group tick.
  *
- * Per-PACKET deadline, stamped by the sender in packet->timestamp_tx as a
- * csp_get_ms() value (0 = none). Normally a stale packet is dropped whole
- * before its first frame (socketcan_tx_thread); this check catches the
- * deadline passing while the kernel refuses a frame mid-packet, and the
- * per-frame CSP_CAN_SOCKETCAN_TX_BUDGET_MS is the final stop for a bus that
- * never recovers. Both leave a partial packet on the wire that every peer
- * times out after CSP_CAN_PBUF_TIMEOUT_MS: the price of not wedging on a dead
- * bus, paid only when it is dead. The CFP1 layer passes the packet on every
- * frame; CFP2 only on the last one, so CFP2 keeps the per-frame budget for
- * all but that frame. */
+ * The per-packet deadline (packet->timestamp_tx) is enforced once, at
+ * dequeue, by socketcan_tx_thread: a stale packet is dropped whole, before
+ * its first frame. Once a frame is on the wire the packet is finished
+ * regardless of the deadline -- abandoning it mid-way would waste the bus
+ * time already spent and leave every peer holding a reassembly buffer for
+ * CSP_CAN_PBUF_TIMEOUT_MS, which is more load on a bus that is already
+ * behind. The only stop here is the per-frame CSP_CAN_SOCKETCAN_TX_BUDGET_MS,
+ * for a bus that never takes a frame again (bus-off, cable out); that one
+ * does leave a partial packet, the price of not wedging the thread. */
 static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * data, uint8_t dlc, const csp_packet_t *packet) {
-	const uint32_t deadline_ms = (packet != NULL) ? packet->timestamp_tx : 0;
+	(void)packet; /* deadline handled at dequeue, see above */
 	if (dlc > CAN_MAX_DLEN) {
 		return CSP_ERR_INVAL;
 	}
@@ -397,13 +396,7 @@ static int csp_can_tx_frame(void * driver_data, uint32_t id, const uint8_t * dat
 			case CSP_CAN_SOCKETCAN_TX_RETRY_SLEEP:
 				/* The socket is non-blocking: ENOBUFS is the qdisc full,
 				 * EAGAIN the socket send buffer full. Either way the
-				 * controller is behind the offered load; wait for it --
-				 * unless the packet's deadline has passed, then drop it now. */
-				if ((deadline_ms != 0) && ((int32_t)(csp_get_ms() - deadline_ms) >= 0)) {
-					ctx->tx_deadline_giveups++;
-					socketcan_log_giveup(ctx, errnum, waiting_ms);
-					return CSP_ERR_TX;
-				}
+				 * controller is behind the offered load; wait for it. */
 				if (errnum == ENOBUFS) {
 					/* qdisc (txqueuelen) full: POLLOUT does not report it, so sleep. */
 					ctx->tx_enobufs_retries++;

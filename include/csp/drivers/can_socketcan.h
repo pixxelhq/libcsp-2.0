@@ -83,10 +83,12 @@ int csp_can_socketcan_build_filters(uint8_t version, uint16_t addr, uint16_t net
 /** Total back-off a single frame may spend before the packet is abandoned.
  *  The dead-bus stop: the TX thread (see CSP_CAN_SOCKETCAN_TX_QUEUE_LEN) gives
  *  up on a packet after this much back-off on one frame, so a bus that never
- *  takes a frame again (bus-off, cable out) cannot wedge the thread. A packet
- *  whose csp_packet_t::timestamp_tx holds a csp_get_ms() deadline is dropped
- *  earlier: whole, when it is dequeued after the deadline, or mid-packet if the
- *  deadline passes while the kernel refuses a frame. */
+ *  takes a frame again (bus-off, cable out) cannot wedge the thread. This is
+ *  the only way a partial packet reaches the wire. A packet whose
+ *  csp_packet_t::timestamp_tx holds a csp_get_ms() deadline is dropped
+ *  earlier, and whole: at dequeue, before its first frame. Once a frame has
+ *  gone out the packet is finished whatever the deadline, so a saturated bus
+ *  costs stale packets, never partial ones. */
 #define CSP_CAN_SOCKETCAN_TX_BUDGET_MS 1000
 /** Packets a transmit queue holds. Each socketcan interface has one, drained
  *  by its own TX thread, so a sender never writes to the socket itself: it
