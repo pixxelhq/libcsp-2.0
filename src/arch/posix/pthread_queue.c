@@ -50,6 +50,35 @@ static inline int init_cond_clock_monotonic(pthread_cond_t * cond) {
 	return ret;
 }
 
+/* A queue is shared by threads of very different real-time priority: the
+ * buffer pool and connection queues serve both a 2 ms receive task and 1 s
+ * senders. With a default mutex, a low-priority thread preempted inside the
+ * few-microsecond critical section blocks a high-priority one for as long as
+ * medium-priority threads keep running (measured: 1.7 ms on a 2 ms rate group,
+ * PolarFire PREEMPT_RT). Priority inheritance bounds that wait to the critical
+ * section. Falls back to a default mutex where the protocol is unsupported. */
+static inline int init_mutex_prio_inherit(pthread_mutex_t * mutex) {
+
+	int ret;
+	pthread_mutexattr_t attr;
+
+	ret = pthread_mutexattr_init(&attr);
+	if (ret != 0) {
+		return pthread_mutex_init(mutex, NULL);
+	}
+
+	ret = pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+	if (ret == 0) {
+		ret = pthread_mutex_init(mutex, &attr);
+	}
+	if (ret != 0) {
+		ret = pthread_mutex_init(mutex, NULL);
+	}
+
+	pthread_mutexattr_destroy(&attr);
+	return ret;
+}
+
 pthread_queue_t * pthread_queue_create(int length, size_t item_size) {
 
 	int ret;
@@ -71,7 +100,7 @@ pthread_queue_t * pthread_queue_create(int length, size_t item_size) {
 	q->in = 0;
 	q->out = 0;
 
-	ret = pthread_mutex_init(&(q->mutex), NULL);
+	ret = init_mutex_prio_inherit(&(q->mutex));
 	if (ret != 0) {
 		goto free_q_buffer;
 	}
